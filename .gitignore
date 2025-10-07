@@ -1,0 +1,9 @@
+/cc
+*.o
+*.s
+*.cc.s
+a.out
+t/tmp*
+t/dt.*
+t/cases.sh
+t/ref.bin
