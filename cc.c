@@ -404,6 +404,15 @@ static Node *new_unary(NodeKind kind, Node *lhs, Token *tok) {
 static Node *new_num(long v, Token *tok) {
   Node *n = new_node(ND_NUM, tok); n->val = v; n->ty = ty_int; return n;
 }
+static Node *new_cast(Node *expr, Type *ty) {
+  Node *n = calloc(1, sizeof(Node));
+  n->kind = ND_CAST;
+  n->tok = expr->tok;
+  n->lhs = expr;
+  n->ty = ty;
+  return n;
+}
+
 static Node *new_var_node(Obj *var, Token *tok) {
   Node *n = new_node(ND_VAR, tok); n->var = var; n->ty = var->ty; return n;
 }
@@ -951,6 +960,15 @@ static Node *funcall(char *name, Token *tok) {
 // primary = "(" expr ")" | "sizeof" unary | ident ("(" args ")")? | num | str
 static Node *unary(void);
 static Node *postfix(void);
+static Node *cast_expr(void);
+
+// abstract-declarator, i.e. a type with no identifier attached.
+static Type *typename_(void) {
+  Type *ty = declspec(NULL);
+  while (consume("*")) ty = pointer_to(ty);
+  while (peek("[")) ty = type_suffix(ty);
+  return ty;
+}
 
 static Node *primary(void) {
   Token *tok = tk;
@@ -968,10 +986,7 @@ static Node *primary(void) {
       Token *save = tk;
       tk = tk->next;
       if (is_typename()) {
-        Type *ty = declspec(NULL);
-        while (consume("*")) ty = pointer_to(ty);
-        // Abstract array declarator: sizeof(int[4]).
-        while (peek("[")) ty = type_suffix(ty);
+        Type *ty = typename_();
         expect(")");
         if (ty->size < 0) error_at(tok->loc, "sizeof applied to an incomplete type");
         return new_num(ty->size, tok);
@@ -1065,12 +1080,12 @@ static Node *postfix(void) {
 // unary = ("+" | "-" | "*" | "&" | "!" | "~" | "++" | "--") unary | postfix
 static Node *unary(void) {
   Token *tok = tk;
-  if (consume("+")) return unary();
-  if (consume("-")) { Node *n = new_unary(ND_NEG, unary(), tok); add_type(n); return n; }
-  if (consume("*")) { Node *n = new_unary(ND_DEREF, unary(), tok); add_type(n); return n; }
-  if (consume("&")) { Node *n = new_unary(ND_ADDR, unary(), tok); add_type(n); return n; }
-  if (consume("!")) { Node *n = new_unary(ND_NOT, unary(), tok); add_type(n); return n; }
-  if (consume("~")) { Node *n = new_unary(ND_BITNOT, unary(), tok); add_type(n); return n; }
+  if (consume("+")) return cast_expr();
+  if (consume("-")) { Node *n = new_unary(ND_NEG, cast_expr(), tok); add_type(n); return n; }
+  if (consume("*")) { Node *n = new_unary(ND_DEREF, cast_expr(), tok); add_type(n); return n; }
+  if (consume("&")) { Node *n = new_unary(ND_ADDR, cast_expr(), tok); add_type(n); return n; }
+  if (consume("!")) { Node *n = new_unary(ND_NOT, cast_expr(), tok); add_type(n); return n; }
+  if (consume("~")) { Node *n = new_unary(ND_BITNOT, cast_expr(), tok); add_type(n); return n; }
   if (consume("++")) {                       // ++i is i = i + 1
     Node *n = unary();
     Node *a = new_binary(ND_ASSIGN, n, new_add(n, new_num(1, tok), tok), tok);
@@ -1084,13 +1099,32 @@ static Node *unary(void) {
   return postfix();
 }
 
+// cast = "(" type-name ")" cast | unary
+//
+// The "(" is ambiguous with a parenthesised expression, and only the scope stack
+// can resolve it: "(x)" is a cast if and only if x names a type here.
+static Node *cast_expr(void) {
+  if (peek("(")) {
+    Token *save = tk;
+    tk = tk->next;
+    if (is_typename()) {
+      Type *ty = typename_();
+      expect(")");
+      Node *n = new_cast(cast_expr(), ty);
+      return n;
+    }
+    tk = save;
+  }
+  return unary();
+}
+
 static Node *mul(void) {
-  Node *n = unary();
+  Node *n = cast_expr();
   for (;;) {
     Token *tok = tk;
-    if (consume("*"))      { n = new_binary(ND_MUL, n, unary(), tok); add_type(n); }
-    else if (consume("/")) { n = new_binary(ND_DIV, n, unary(), tok); add_type(n); }
-    else if (consume("%")) { n = new_binary(ND_MOD, n, unary(), tok); add_type(n); }
+    if (consume("*"))      { n = new_binary(ND_MUL, n, cast_expr(), tok); add_type(n); }
+    else if (consume("/")) { n = new_binary(ND_DIV, n, cast_expr(), tok); add_type(n); }
+    else if (consume("%")) { n = new_binary(ND_MOD, n, cast_expr(), tok); add_type(n); }
     else return n;
   }
 }
@@ -1526,6 +1560,31 @@ static void cmp_zero(Type *ty) {
   else                                 emit("cmp $0, %%rax");
 }
 
+// Convert the value in rax from one type to another. The rules that matter:
+// narrowing truncates, widening sign- or zero-extends depending on the SOURCE's
+// signedness, and anything to _Bool is a comparison against zero.
+static void gen_cast(Type *from, Type *to) {
+  if (to->kind == TY_VOID) return;
+
+  if (to->kind == TY_BOOL) {
+    cmp_zero(from);
+    emit("setne %%al");
+    emit("movzb %%al, %%rax");
+    return;
+  }
+
+  if (is_pointer(to) || to->size == 8) {
+    // Widening to 64 bits: the source's signedness decides the extension.
+    if (is_integer(from) && from->size < 8)
+      emit(from->is_unsigned ? "mov %%eax, %%eax" : "movsxd %%eax, %%rax");
+    return;
+  }
+
+  if (to->size == 1)      emit(to->is_unsigned ? "movzbl %%al, %%eax" : "movsbl %%al, %%eax");
+  else if (to->size == 2) emit(to->is_unsigned ? "movzwl %%ax, %%eax" : "movswl %%ax, %%eax");
+  else if (to->size == 4) emit("mov %%eax, %%eax");     // truncate to 32 bits
+}
+
 static void gen_expr(Node *n) {
   switch (n->kind) {
   case ND_NUM:
@@ -1558,6 +1617,7 @@ static void gen_expr(Node *n) {
     return;
   case ND_CAST:
     gen_expr(n->lhs);
+    gen_cast(n->lhs->ty, n->ty);
     return;
   case ND_ASSIGN:
     gen_addr(n->lhs);
