@@ -624,6 +624,10 @@ static Obj *new_string_literal(Token *t) {
 static Node *expr(void);
 static Node *assign(void);
 static Node *conditional(void);
+// Pointer arithmetic lives in new_add/new_sub, which the initialiser walker needs
+// in order to build a[i] as *(a+i) and get the element scaling for free.
+static Node *new_add(Node *lhs, Node *rhs, Token *tok);
+static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
 static Node *stmt(void);
 static Node *compound_stmt(void);
 static Type *declspec(VarAttr *attr);
@@ -733,7 +737,9 @@ static long const_expr(void) { return eval(conditional()); }
 
 static Type *type_suffix(Type *ty) {
   if (consume("[")) {
-    // A dimension may be any constant expression: [N], [2*N], [sizeof(x)].
+    // An omitted dimension means "infer it from the initialiser"; it is recorded
+    // as -1 and patched in declaration() once the initialiser has been counted.
+    if (consume("]")) return array_of(type_suffix(ty), -1);
     long len = const_expr();
     if (len < 0) error_at(tk->loc, "negative array size");
     expect("]");
@@ -861,7 +867,131 @@ static Member *get_member(Type *ty, Token *t) {
   return NULL;
 }
 
-// declaration = declspec declarator ("=" expr)? ("," declarator ("=" expr)?)* ";"
+static Node *as_stmt(Node *lhs, Node *rhs, Token *tok) {
+  Node *a = new_binary(ND_ASSIGN, lhs, rhs, tok);
+  add_type(a);
+  return new_unary(ND_EXPR_STMT, a, tok);
+}
+
+// a[i], built as *(a+i) so the existing pointer arithmetic does the scaling.
+static Node *elem_of(Node *base, int i, Token *tok) {
+  Node *n = new_unary(ND_DEREF, new_add(base, new_num(i, tok), tok), tok);
+  add_type(n);
+  return n;
+}
+
+static Node *member_of(Node *base, Member *m, Token *tok) {
+  Node *n = new_unary(ND_MEMBER, base, tok);
+  n->member = m;
+  n->ty = m->ty;
+  return n;
+}
+
+// C zero-initialises whatever an initialiser list leaves out, which has to be
+// done explicitly here because locals live on an uninitialised stack.
+static void zero_walk(Node *base, Type *ty, Node **cur, Token *tok) {
+  if (ty->kind == TY_ARRAY) {
+    for (int i = 0; i < ty->array_len; i++)
+      zero_walk(elem_of(base, i, tok), ty->base, cur, tok);
+    return;
+  }
+  if (is_aggregate(ty)) {
+    for (Member *m = ty->members; m; m = m->next) {
+      zero_walk(member_of(base, m, tok), m->ty, cur, tok);
+      if (ty->kind == TY_UNION) break;      // one member covers the storage
+    }
+    return;
+  }
+  *cur = (*cur)->next = as_stmt(base, new_num(0, tok), tok);
+}
+
+// Counts top-level elements of a brace initialiser without consuming it, so an
+// unsized array can learn its own length.
+static int count_init_elems(void) {
+  Token *save = tk;
+  if (!peek("{")) error_at(tk->loc, "expected an initialiser list");
+  tk = tk->next;
+
+  bool empty = peek("}");
+  int depth = 0, commas = 0;
+  Token *prev = NULL;
+  while (!(depth == 0 && peek("}"))) {
+    if (tk->kind == TK_EOF) error_at(save->loc, "unterminated initialiser");
+    if (tok_is(tk, "{")) depth++;
+    else if (tok_is(tk, "}")) depth--;
+    else if (depth == 0 && tok_is(tk, ",")) commas++;
+    prev = tk;
+    tk = tk->next;
+  }
+  tk = save;
+  if (empty) return 0;
+  // A trailing comma is legal and does not introduce an element.
+  return (prev && tok_is(prev, ",")) ? commas : commas + 1;
+}
+
+// Emits the statements that initialise the lvalue `base` of type `ty`.
+static void init_walk(Node *base, Type *ty, Node **cur, Token *tok) {
+  // char s[] = "abc";  copies the bytes including the terminating NUL.
+  if (ty->kind == TY_ARRAY && ty->base->size == 1 && tk->kind == TK_STR) {
+    Token *str = tk;
+    tk = tk->next;
+    for (int i = 0; i < ty->array_len; i++) {
+      int ch = (i < str->str_len) ? (unsigned char)str->str[i] : 0;
+      *cur = (*cur)->next = as_stmt(elem_of(base, i, tok), new_num(ch, tok), tok);
+    }
+    return;
+  }
+
+  if (ty->kind == TY_ARRAY) {
+    expect("{");
+    int i = 0;
+    bool first = true;
+    while (!peek("}")) {
+      if (!first) expect(",");
+      first = false;
+      if (peek("}")) break;                       // trailing comma
+      if (i >= ty->array_len) error_at(tk->loc, "too many initialisers for this array");
+      init_walk(elem_of(base, i, tok), ty->base, cur, tok);
+      i++;
+    }
+    expect("}");
+    for (; i < ty->array_len; i++)
+      zero_walk(elem_of(base, i, tok), ty->base, cur, tok);
+    return;
+  }
+
+  if (is_aggregate(ty)) {
+    expect("{");
+    Member *m = ty->members;
+    bool first = true;
+    while (!peek("}")) {
+      if (!first) expect(",");
+      first = false;
+      if (peek("}")) break;
+      if (!m) error_at(tk->loc, "too many initialisers for this struct");
+      init_walk(member_of(base, m, tok), m->ty, cur, tok);
+      m = m->next;
+      if (ty->kind == TY_UNION) break;            // only the first member
+    }
+    expect("}");
+    for (; m; m = m->next) {
+      zero_walk(member_of(base, m, tok), m->ty, cur, tok);
+      if (ty->kind == TY_UNION) break;
+    }
+    return;
+  }
+
+  // Scalar. A brace around a scalar is legal: int x = {1};
+  if (consume("{")) {
+    *cur = (*cur)->next = as_stmt(base, assign(), tok);
+    consume(",");
+    expect("}");
+    return;
+  }
+  *cur = (*cur)->next = as_stmt(base, assign(), tok);
+}
+
+// declaration = declspec declarator ("=" initialiser)? ("," ...)* ";"
 static Node *declaration(void) {
   VarAttr attr = {0};
   Type *base = declspec(&attr);
@@ -882,15 +1012,26 @@ static Node *declaration(void) {
     }
 
     if (ty->kind == TY_VOID) error_at(tk->loc, "variable declared void");
+
+    // An unsized array learns its length from the initialiser, so the length has
+    // to be settled before the Obj is created and given a stack slot.
+    if (ty->kind == TY_ARRAY && ty->array_len < 0) {
+      if (!peek("=")) error_at(tk->loc, "array size missing and no initialiser to infer it from");
+      Token *eq = tk;
+      tk = tk->next;
+      int n;
+      if (tk->kind == TK_STR) n = tk->str_len;        // includes the NUL
+      else n = count_init_elems();
+      ty = array_of(ty->base, n);
+      tk = eq;                                        // put '=' back
+    }
+
     if (ty->size < 0) error_at(tk->loc, "variable has incomplete type");
     Obj *var = new_var(name, ty, true);
 
     if (consume("=")) {
-      Node *lhs = new_var_node(var, tk);
-      Node *rhs = assign();
-      Node *a = new_binary(ND_ASSIGN, lhs, rhs, tk);
-      add_type(a);
-      cur = cur->next = new_unary(ND_EXPR_STMT, a, tk);
+      Token *tok = tk;
+      init_walk(new_var_node(var, tok), ty, &cur, tok);
     }
   }
 
