@@ -69,37 +69,34 @@ possible, because the fixpoint is worth more than any individual feature.
            codegen
       proves: inferred lengths, zero fill, 2D arrays, arrays of structs
 - [x] 06 t/addcase.sh -- expectations derived from gcc, cross-checked with clang
-
 ### Milestone 1 -- self-host
 
-Ordered by what `cc.c` itself actually uses. Nothing here is speculative; each
-is a feature the compiler's own source needs.
+Everything remaining is ordered by what `cc.c` itself uses. Nothing here is
+speculative; each is a feature the compiler's own source needs.
 
-- [ ] 02 `struct` and `union`: member access, `.` and `->`, layout and padding
-      why: `Token`, `Type`, `Node`, `Obj` are all structs. Hard blocker.
-      proves: differential cases for nested structs and member assignment
-- [ ] 03 `enum`
-      why: `TokenKind`, `TypeKind`, `NodeKind`
-- [ ] 04 `typedef`
-      why: every `typedef struct Token Token;` in cc.c
-- [ ] 05 block-local scope, so inner blocks shadow correctly
-      why: currently one flat scope per function; cc.c relies on real scoping
-      proves: a case where an inner `int i` must not clobber the outer one
-- [ ] 06 the preprocessor: `#include`, object and function macros, `#if`/`#ifdef`,
-      `#define`, token pasting, stringification
-      why: no `#include <stdio.h>` means no self-host. Biggest single chunk.
-      note: replaces the `cpp` shim; expect this to take longer than 02-05 put together
-- [ ] 07 `switch` / `case` / `default`, `goto`, labels
-- [ ] 08 casts and explicit conversions
-- [ ] 09 `unsigned` types and the correct promotion rules
-- [ ] 10 function prototypes, so calls stop assuming a `long` return
-- [ ] 11 `static` and `extern` linkage
-- [ ] 12 variadic functions (`stdarg.h` against the real ABI)
+- [ ] 07 the preprocessor: `#include`, object and function macros, `#if`/`#ifdef`,
+      token pasting, stringification, and the recursive-expansion hide-set rules
+      why: no `#include <stdio.h>` means no self-host. **The biggest single chunk
+           left -- expect it to take longer than 02 through 06 put together.**
+      note: glibc's headers weaponise GNU C. `__attribute__`, statement
+            expressions, `typeof`, `__builtin_*` and asm labels all appear before
+            you reach anything useful. This is the main schedule risk in the
+            whole project.
+- [ ] 08 function prototypes, so a call stops assuming a `long` return
+- [ ] 09 `static` and `extern` linkage, and `static` locals
+- [ ] 10 global initialisers (`int x = 5;` at file scope, and string pointers)
+      why: currently every global is `.zero`-filled
+- [ ] 11 variadic function definitions, `stdarg.h` against the real ABI
+- [ ] 12 bitfields
+      why: `sqlite3.c` uses them, and they are the largest typical `c-testsuite`
+           failure cluster
 - [ ] 13 struct arguments and returns -- the SysV eightbyte classification
-      why: the single nastiest part of the ABI, and where `sqlite3.c` will break
-      proves: differential cases passing and returning structs of every size
-              class across the gcc boundary
-- [ ] 14 **self-host**: `cmp cc2 cc3` in CI
+      why: the nastiest part of the ABI. Currently rejected with an explicit
+           error rather than miscompiled, which is the right interim answer.
+      proves: passing and returning structs of every size class across the gcc
+              boundary
+- [ ] 14 integer promotion done properly, rather than the current approximation
+- [ ] 15 **self-host**: `cmp cc2 cc3` in CI
       proves: the fixpoint invariant, from here to the end of the project
 
 ### Milestone 2 -- external conformance
