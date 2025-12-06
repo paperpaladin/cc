@@ -74,7 +74,11 @@ possible, because the fixpoint is worth more than any individual feature.
 Everything remaining is ordered by what `cc.c` itself uses. Nothing here is
 speculative; each is a feature the compiler's own source needs.
 
-- [ ] 07 the preprocessor: `#include`, object and function macros, `#if`/`#ifdef`,
+The preprocessor (07) is done. What `cc.c` still needs from the list below,
+by inspection of its own source: function prototypes, `static`, global
+initialisers, and variadic definitions for the error helpers.
+
+- [x] 07 the preprocessor: `#include`, object and function macros, `#if`/`#ifdef`,
       token pasting, stringification, and the recursive-expansion hide-set rules
       why: no `#include <stdio.h>` means no self-host. **The biggest single chunk
            left -- expect it to take longer than 02 through 06 put together.**
@@ -82,6 +86,22 @@ speculative; each is a feature the compiler's own source needs.
             expressions, `typeof`, `__builtin_*` and asm labels all appear before
             you reach anything useful. This is the main schedule risk in the
             whole project.
+      done: in two commits -- the tokenizer gaining files, lines and at_bol
+            first, with no behaviour change, then the preprocessor itself.
+            56 cases in t/cpp.sh, every expectation from gcc -E -P and
+            clang -E -P, both of which must agree. C99 6.10.3.5 examples 3
+            and 5 are in verbatim.
+            Three bugs the oracle found, in rising order of interest:
+            skip_line() returned its argument unchanged when that argument
+            already began a line, so skipping a false #if never advanced and
+            hung; string concatenation was being done inside preprocess(),
+            which is phase 6 run during phase 4 and made `S(a) S(b)` print
+            one literal; and an expansion kept the line of its #define, so
+            __LINE__ inside a macro body reported where the macro was written
+            rather than where it was used.
+            The GNU note above has not been tested yet. Nothing here has met
+            /usr/include, and item 15 is where that bill arrives.
+      proves: 7 planted defects, 7 caught -- see the table in the README.
 - [ ] 08 function prototypes, so a call stops assuming a `long` return
 - [ ] 09 `static` and `extern` linkage, and `static` locals
 - [ ] 10 global initialisers (`int x = 5;` at file scope, and string pointers)
