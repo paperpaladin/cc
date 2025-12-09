@@ -437,6 +437,9 @@ struct Obj {
   Obj *locals;
   Node *body;
   int stack_size;
+  bool is_variadic;   // declared with a trailing "..."
+  bool has_proto;     // "f(void)" or "f(int)" promise an argument list;
+                      // "f()" in C promises nothing, so it is not checked
 };
 
 struct Node {
@@ -455,6 +458,7 @@ struct Node {
   // ND_FUNCALL
   char *funcname;
   Node *args;
+  Obj *fn;         // the declaration, when there is one
 
   Member *member;  // ND_MEMBER
 
@@ -557,7 +561,13 @@ static void add_type(Node *n) {
     n->ty = n->lhs->ty->base;
     return;
   case ND_FUNCALL:
-    n->ty = ty_long;   // shortcut: no prototypes yet, so assume long. See PLAN.md.
+    // A declared function has a return type. An undeclared one does not, and
+    // C89's implicit "int" would silently truncate every pointer returned by
+    // an undeclared malloc, so the older and wider assumption is kept for
+    // that case and the README says so.
+    // shortcut: implicit declarations assume long. Make them an error once
+    // cc.c itself declares everything it calls.
+    n->ty = n->fn ? n->fn->ty->ret : ty_long;
     return;
   default:
     return;
@@ -663,7 +673,12 @@ static Obj *new_var(char *name, Type *ty, bool is_local) {
   v->name = name; v->ty = ty; v->is_local = is_local;
   if (is_local) { v->next = locals; locals = v; }
   else          { v->next = globals; globals = v; }
-  push_scope(name)->var = v;
+  // An unnamed parameter -- "int f(int, int b)" -- still needs its Obj, so
+  // that it occupies an argument register and the parameters after it land in
+  // the right ones. What it must not get is a scope entry: nothing can refer
+  // to it, and a NULL name in the scope list is a strlen() crash waiting for
+  // the first lookup that has to scan past it.
+  if (name) push_scope(name)->var = v;
   return v;
 }
 
@@ -1174,16 +1189,49 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
 }
 
 static Node *funcall(char *name, Token *tok) {
+  // The declaration, if this call has one. Looked up before the arguments are
+  // parsed so each one can be converted to its parameter's type on the way in.
+  VarScope *vs = find_name(tok);
+  Obj *fn = (vs && vs->var && vs->var->is_function) ? vs->var : NULL;
+  Obj *param = fn ? fn->params : NULL;
+
   Node head = {0};
   Node *cur = &head;
+  int nargs = 0;
+
   while (!consume(")")) {
     if (cur != &head) expect(",");
-    cur = cur->next = assign();
-    add_type(cur);
+    Token *atok = tk;
+    Node *arg = assign();
+    add_type(arg);
+
+    if (param) {
+      if (is_aggregate(param->ty))
+        error_at(atok->loc, "passing a struct or union by value is not supported yet "
+                            "(needs SysV eightbyte classification; see PLAN.md)");
+      // Converted as if by assignment, which is the whole point of having the
+      // prototype: f(char) called with an int must narrow at the call, not
+      // inside the callee where the value has already arrived wrong.
+      arg = new_cast(arg, param->ty);
+      param = param->next;
+    } else if (fn && fn->has_proto && !fn->is_variadic) {
+      error_at(atok->loc, "too many arguments to '%s'", name);
+    }
+
+    cur = cur->next = arg;
+    nargs++;
   }
+
+  // "f()" with empty parens declares nothing about its arguments, so only a
+  // real prototype is allowed to complain about the count.
+  if (fn && fn->has_proto && param)
+    error_at(tok->loc, "too few arguments to '%s'", name);
+
   Node *n = new_node(ND_FUNCALL, tok);
   n->funcname = name;
   n->args = head.next;
+  n->fn = fn;
+  (void)nargs;
   return n;
 }
 
@@ -1663,15 +1711,26 @@ static Obj *function(Type *base) {
   // stack offsets come out in declaration order.
   Obj phead = {0};
   Obj *pcur = &phead;
+  bool variadic = false;
+  // "f()" says nothing about its arguments and "f(void)" says there are none.
+  // Both produce an empty parameter list, so the difference has to be noticed
+  // here or it is lost: only the second one may be checked at a call.
+  bool has_proto = !peek(")");
   if (peek("void") && tok_is(tk->next, ")")) tk = tk->next;   // f(void)
   bool pfirst = true;
   while (!consume(")")) {
     if (!pfirst) expect(",");
     pfirst = false;
-    if (consume("...")) { expect(")"); break; }   // varargs: callee ignores them
+    if (consume("...")) { expect(")"); variadic = true; break; }
     Type *pbase = declspec(NULL);
-    char *pname;
-    Type *pty = declarator(pbase, &pname);
+    // A parameter name is optional, and in a prototype it is usually absent:
+    // "int f(int);" is the form almost every header uses. The type is what
+    // matters at a call; the name only matters to a body.
+    char *pname = NULL;
+    Type *pty = pbase;
+    while (consume("*")) pty = pointer_to(pty);
+    if (tk->kind == TK_IDENT) pname = get_ident();
+    pty = type_suffix(pty);
     if (pty->kind == TY_ARRAY) pty = pointer_to(pty->base);   // arrays decay
     Obj *p = calloc(1, sizeof(Obj));
     p->name = pname; p->ty = pty;
@@ -1686,12 +1745,30 @@ static Obj *function(Type *base) {
     error_at(tk->loc, "returning a struct or union by value is not supported yet "
                       "(needs SysV eightbyte classification; see PLAN.md)");
 
-  Obj *fn = calloc(1, sizeof(Obj));
-  fn->name = name;
-  fn->ty = func_returning(ty);
-  fn->is_function = true;
-  fn->next = globals;
-  globals = fn;
+  // A prototype followed by a definition is one function, not two. Creating a
+  // second Obj would put a second symbol in the output and leave the call
+  // sites bound to whichever happened to be found first.
+  Obj *fn = NULL;
+  for (Obj *g = globals; g; g = g->next)
+    if (g->is_function && !strcmp(g->name, name)) { fn = g; break; }
+
+  if (fn) {
+    if (fn->ty->ret->kind != ty->kind || fn->ty->ret->is_unsigned != ty->is_unsigned)
+      error_at(tk->loc, "'%s' redeclared with a different return type", name);
+  } else {
+    fn = calloc(1, sizeof(Obj));
+    fn->name = name;
+    fn->ty = func_returning(ty);
+    fn->is_function = true;
+    fn->next = globals;
+    globals = fn;
+    // Into the file scope, so a call can find it. This has to happen before
+    // enter_scope() below, and before the body is parsed, or a recursive call
+    // would not see its own function.
+    push_scope(name)->var = fn;
+  }
+  fn->is_variadic = variadic;
+  fn->has_proto = has_proto;
 
   // Parameters and body share one scope, so a parameter can be shadowed by a
   // declaration in an inner block but not by one at the top level of the body.

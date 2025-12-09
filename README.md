@@ -63,6 +63,13 @@ uninitialised stack.
 **Calls** -- definitions and calls up to 6 arguments, recursion, and calls into
 libc that get the ABI right.
 
+**Function prototypes** -- a declaration gives a call its return type, so
+`sizeof(f())` is right and a returned pointer can be dereferenced. Arguments
+are converted to their parameter types at the call, and the argument count is
+checked. `f(void)` and `f()` are kept apart: the first promises no arguments
+and is checked, the second promises nothing and is not. A call to an
+undeclared function still works and still assumes it returns `long`.
+
 **Preprocessor** -- `#include` (both spellings, with `-I`), object and
 function-like macros, `#undef`, the full `#if`/`#ifdef`/`#ifndef`/`#elif`/
 `#else`/`#endif` family with constant-expression evaluation and `defined`,
@@ -80,8 +87,7 @@ A stray backslash outside a string literal is rejected rather than carried
 along as a preprocessing token, which is legal C that real preprocessors
 accept; nothing here needs it, and the tokenizer is simpler without it.
 
-No `float` or `double`. No `static` or `extern` linkage. No function prototypes,
-so a call assumes a `long` return. No bitfields. No variadic function
+No `float` or `double`. No `static` or `extern` linkage. No bitfields. No variadic function
 *definitions* (calling a variadic function works). Passing or returning a struct
 **by value** is rejected with an explicit error rather than silently
 miscompiled -- that needs the SysV eightbyte classification algorithm, which is
@@ -194,6 +200,25 @@ were planted in the preprocessor one at a time:
 All seven. The fourth is the one worth having: it fails nothing about what the
 tokens *are*, only that printing them loses information, and it is caught only
 because the suite re-reads its own output rather than trusting it.
+
+The same was done for prototypes, and there the exercise paid for itself
+immediately. Seven defects, six caught, and the survivor was **"arguments are
+not converted at the call"** -- which the suite was supposed to cover.
+
+The test was `g(300)` against `int g(char c)`, expecting 44. It returns 44
+whether or not the call converts anything, because the callee stores its
+parameter into a one-byte slot and truncates it there. The assertion was true
+and meaningless. Narrowing cannot test a call-site conversion; only widening
+can, because an `int` in a register says nothing about its top 32 bits and the
+callee is too late to fix it:
+
+```c
+int f(long x){ return x == -1; }
+int main(){ int i = -1; return f(i); }   // 1 only if the call sign-extends
+```
+
+With that case in, the mutant dies. Finding it also turned up an unrelated
+miscompilation in unsigned comparison, which is fixed in the commit after.
 
 ## License
 
