@@ -217,8 +217,35 @@ int f(long x){ return x == -1; }
 int main(){ int i = -1; return f(i); }   // 1 only if the call sign-extends
 ```
 
-With that case in, the mutant dies. Finding it also turned up an unrelated
-miscompilation in unsigned comparison, which is fixed in the commit after.
+With that case in, the mutant dies.
+
+### The bug that found itself
+
+Writing those cases turned up a miscompilation nothing was looking for:
+
+```c
+unsigned x = -1;
+x < 5     // 0, correct
+x > 5     // 0, and it should be 1
+```
+
+`>` is parsed as `<` with the operands swapped, and the signedness of the
+comparison was read from the left operand alone. After the swap that is
+whichever side the literal landed on, so the same variable compared unsigned
+one way round and signed the other. It now follows C 6.3.1.8 and looks at
+both, which also fixes `2 / x` for unsigned `x` on the right.
+
+Two things that rule must *not* do, each with its own case in the suite
+because `>` and `<` put the operands in opposite positions:
+
+- an `unsigned char` promotes to signed `int`, so `x > -1` is true
+- an `unsigned int` widens to `long` on LP64, so `l < u` stays signed
+
+The first mutant written for this was itself wrong, and worth recording: it
+removed the promotion from the *left* operand while the test case had the
+narrow type on the *right*, so identical assembly came out and the mutant
+looked like it survived. A mutation test can be vacuous exactly like an
+ordinary one.
 
 ## License
 

@@ -128,11 +128,22 @@ initialisers, and variadic definitions for the error helpers.
       note: finding that turned up an unrelated miscompilation -- unsigned
             relational comparison uses the signed condition codes, so
             `unsigned x = -1; x > 0` is 0. Item 08b below.
-- [ ] 08b unsigned relational operators use the unsigned condition codes
-      why: `unsigned x = -1; x > 0` returns 0 and should return 1. Division
-           and equality are already right, so this is only the four
-           relational forms. Found while building the prototype cases, not
-           by anything that was looking for it.
+- [x] 08b unsigned relational operators use the unsigned condition codes
+      why: `unsigned x = -1; x > 0` returned 0 and should return 1. Found
+           while building the prototype cases, not by anything looking for it.
+      done: the codegen was already right -- it picks setb or setl from a
+            `uns` flag. The flag was wrong: it read `n->lhs->ty` only, and
+            since `>` is parsed as `<` with the operands swapped, that is
+            whichever side the literal landed on. The same variable compared
+            unsigned as `x < 5` and signed as `x > 5`.
+            op_unsigned() now applies C 6.3.1.8 to both operands: promote
+            anything narrower than int to signed int, the wider rank wins
+            outright, and at equal rank unsigned wins. That also fixes
+            `2 / x` for an unsigned x on the right, which had the same cause.
+      note: the first mutant for this was vacuous. It removed the promotion
+            from the left operand while the test case had the narrow type on
+            the right, produced byte-identical assembly, and looked like a
+            survivor. Both operand positions now have their own case.
 - [ ] 09 `static` and `extern` linkage, and `static` locals
 - [ ] 10 global initialisers (`int x = 5;` at file scope, and string pointers)
       why: currently every global is `.zero`-filled
