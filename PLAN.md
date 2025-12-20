@@ -144,7 +144,30 @@ initialisers, and variadic definitions for the error helpers.
             from the left operand while the test case had the narrow type on
             the right, produced byte-identical assembly, and looked like a
             survivor. Both operand positions now have their own case.
-- [ ] 09 `static` and `extern` linkage, and `static` locals
+- [x] 09 `static` and `extern` linkage, and `static` locals
+      done: a storage class on the Obj, honoured at emission -- no .globl for
+            a static, and nothing emitted at all for an extern, which would
+            otherwise be a second definition of a symbol another object owns.
+            A static local is the interesting one: block scope, static
+            storage, so it is a global announced inside a function. Two
+            functions may each have a static "n", so the label is mangled
+            n.0, n.1 the way gcc does it -- the dot is the point, since no C
+            identifier contains one and nothing in the source can collide.
+            The source name is pushed into the block scope separately, or the
+            variable is unreachable by the name it was written with.
+            An initialiser on a static local is refused with a message naming
+            item 10, rather than silently ignored.
+      proves: 5 planted defects, 5 caught -- after the suite grew the one
+            case that could see linkage at all. See below.
+      note: "static global still gets .globl" survived the first mutation
+            round, and correctly: a single-file program behaves identically
+            whether or not its statics are exported. Internal linkage has no
+            observable consequence until a second translation unit defines
+            the same name. t/run.sh now builds three files, two of which
+            each declare `static int g`, and links them. With the .globl
+            restored the linker folds the two g's into one and the answer
+            changes from 12 to 22 -- in practice it fails earlier, at
+            "multiple definition of g".
 - [ ] 10 global initialisers (`int x = 5;` at file scope, and string pointers)
       why: currently every global is `.zero`-filled
 - [ ] 11 variadic function definitions, `stdarg.h` against the real ABI

@@ -159,7 +159,7 @@ static char *KEYWORDS[] = {
   "return", "if", "else", "for", "while", "do", "break", "continue",
   "int", "char", "long", "short", "void", "sizeof", "typedef",
   "struct", "union", "enum", "switch", "case", "default", "goto",
-  "unsigned", "signed", "_Bool", NULL,
+  "unsigned", "signed", "_Bool", "static", "extern", NULL,
 };
 
 static bool is_keyword(Token *t) {
@@ -427,6 +427,8 @@ struct Obj {
   bool is_local;
   bool is_function;
   bool is_definition;
+  bool is_static;      // internal linkage: no .globl
+  bool is_extern;      // declared elsewhere: reference it, do not define it
   // local
   int offset;
   // global data
@@ -621,7 +623,7 @@ static Scope file_scope;
 static Scope *scope = &file_scope;
 
 // Storage-class bits picked up by declspec and handed back to its caller.
-typedef struct { bool is_typedef; } VarAttr;
+typedef struct { bool is_typedef; bool is_static; bool is_extern; } VarAttr;
 
 static void enter_scope(void) {
   Scope *s = calloc(1, sizeof(Scope));
@@ -738,7 +740,7 @@ static long const_expr(void);
 
 static char *TYPE_KEYWORDS[] = {
   "int", "char", "long", "short", "void", "unsigned", "signed", "_Bool",
-  "struct", "union", "enum", "typedef", NULL,
+  "struct", "union", "enum", "typedef", "static", "extern", NULL,
 };
 
 // A declaration can start with a type keyword, a storage class, or a name that
@@ -760,6 +762,14 @@ static Type *declspec(VarAttr *attr) {
       if (!attr) error_at(tk->loc, "typedef is not allowed here");
       tk = tk->next;
       attr->is_typedef = true;
+      continue;
+    }
+    if (peek("static") || peek("extern")) {
+      if (!attr) error_at(tk->loc, "a storage class is not allowed here");
+      if (peek("static")) attr->is_static = true; else attr->is_extern = true;
+      if (attr->is_static && attr->is_extern)
+        error_at(tk->loc, "static and extern are mutually exclusive");
+      tk = tk->next;
       continue;
     }
     break;
@@ -1091,6 +1101,17 @@ static void init_walk(Node *base, Type *ty, Node **cur, Token *tok) {
   *cur = (*cur)->next = as_stmt(base, assign(), tok);
 }
 
+// Two statics called "n" in two functions are two objects, and both want the
+// label "n". The counter is the whole mechanism; gcc spells it n.0, n.1 and
+// the dot is deliberate, since no C identifier can contain one and so nothing
+// in the source can ever collide with a generated name.
+static char *static_local_name(char *name) {
+  static int seq = 0;
+  char *s = malloc(strlen(name) + 16);
+  sprintf(s, "%s.%d", name, seq++);
+  return s;
+}
+
 // declaration = declspec declarator ("=" initialiser)? ("," ...)* ";"
 static Node *declaration(void) {
   VarAttr attr = {0};
@@ -1127,6 +1148,24 @@ static Node *declaration(void) {
     }
 
     if (ty->size < 0) error_at(tk->loc, "variable has incomplete type");
+
+    // A static local has block scope and static storage: the name is visible
+    // only here, but the object outlives the call and keeps its value. So it
+    // is a global that happens to be announced inside a function, and the
+    // only real work is giving it a name the assembler will not collide with
+    // some other function's static of the same name.
+    if (attr.is_static) {
+      Obj *var = new_var(static_local_name(name), ty, false);
+      var->is_static = true;
+      // new_var pushed the mangled name; the source name is what has to
+      // resolve inside this block.
+      push_scope(name)->var = var;
+      if (peek("="))
+        error_at(tk->loc, "an initialiser on a static local is not supported yet "
+                          "(needs global initialisers; see PLAN.md item 10)");
+      continue;
+    }
+
     Obj *var = new_var(name, ty, true);
 
     if (consume("=")) {
@@ -1698,7 +1737,7 @@ static void create_param_vars(Obj *params) {
 }
 
 // function = declspec declarator "(" params ")" ("{" compound_stmt | ";")
-static Obj *function(Type *base) {
+static Obj *function(Type *base, VarAttr *attr) {
   char *name;
   Type *ty = base;
   while (consume("*")) ty = pointer_to(ty);
@@ -1769,6 +1808,10 @@ static Obj *function(Type *base) {
   }
   fn->is_variadic = variadic;
   fn->has_proto = has_proto;
+  // "static int f();" then "int f() {...}" keeps the internal linkage the
+  // first declaration gave it, which is what C says and what the linker will
+  // assume either way.
+  if (attr && attr->is_static) fn->is_static = true;
 
   // Parameters and body share one scope, so a parameter can be shadowed by a
   // declaration in an inner block but not by one at the top level of the body.
@@ -1818,8 +1861,13 @@ static void global_variable(Type *base, VarAttr *attr) {
     char *name;
     Type *ty = declarator(base, &name);
     if (attr && attr->is_typedef) { push_scope(name)->type_def = ty; continue; }
-    if (ty->size < 0) error_at(tk->loc, "global has incomplete type");
-    new_var(name, ty, false);
+    // An extern declaration names something defined in another translation
+    // unit, so its size may well be unknown here and emitting storage for it
+    // would create a second definition at link time.
+    if (!(attr && attr->is_extern) && ty->size < 0)
+      error_at(tk->loc, "global has incomplete type");
+    Obj *v = new_var(name, ty, false);
+    if (attr) { v->is_static = attr->is_static; v->is_extern = attr->is_extern; }
   }
 }
 
@@ -1845,7 +1893,7 @@ static Obj *parse(Token *t) {
     // "struct foo { ... };" declares a tag and nothing else.
     if (consume(";")) continue;
 
-    if (!attr.is_typedef && is_function_decl()) function(base);
+    if (!attr.is_typedef && is_function_decl()) function(base, &attr);
     else global_variable(base, &attr);
   }
   return globals;
@@ -3320,6 +3368,9 @@ static void gen_stmt(Node *n) {
 static void emit_data(Obj *globals_) {
   for (Obj *v = globals_; v; v = v->next) {
     if (v->is_function) continue;
+    // extern is a promise that someone else defines it. Emitting .zero here
+    // would make this file a second definition of the same symbol.
+    if (v->is_extern) continue;
 
     if (v->init_data) {
       fprintf(out, "  .section .rodata\n");
@@ -3329,7 +3380,7 @@ static void emit_data(Obj *globals_) {
       continue;
     }
     fprintf(out, "  .data\n");
-    fprintf(out, "  .globl %s\n", v->name);
+    if (!v->is_static) fprintf(out, "  .globl %s\n", v->name);
     fprintf(out, "%s:\n", v->name);
     fprintf(out, "  .zero %d\n", v->ty->size);
   }
@@ -3341,7 +3392,7 @@ static void emit_text(Obj *globals_) {
     current_fn = fn;
 
     fprintf(out, "  .text\n");
-    fprintf(out, "  .globl %s\n", fn->name);
+    if (!fn->is_static) fprintf(out, "  .globl %s\n", fn->name);
     fprintf(out, "  .type %s, @function\n", fn->name);
     fprintf(out, "%s:\n", fn->name);
 
