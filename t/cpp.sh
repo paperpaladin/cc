@@ -16,7 +16,7 @@
 # not to match them.
 set -eu
 cd "$(dirname "$0")/.."
-CC=./cc
+CC=${CCBIN:-./cc}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 

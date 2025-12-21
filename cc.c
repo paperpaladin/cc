@@ -419,6 +419,19 @@ typedef enum {
 
 typedef struct Node Node;
 typedef struct Obj Obj;
+typedef struct Relocation Relocation;
+
+// A slot in a global's initialiser whose value is an address, and so cannot
+// be a byte pattern: the linker has to fill it in. "char *p = \"abc\";" is
+// eight bytes of nothing plus the instruction to put the string's address
+// there. Kept in a sorted list so emission can walk bytes and relocations
+// together in one pass.
+struct Relocation {
+  Relocation *next;
+  int offset;
+  char *label;
+  long addend;
+};
 
 struct Obj {
   Obj *next;
@@ -427,13 +440,15 @@ struct Obj {
   bool is_local;
   bool is_function;
   bool is_definition;
+  bool is_anon_str;    // a string literal's storage: .rodata, never .globl
   bool is_static;      // internal linkage: no .globl
   bool is_extern;      // declared elsewhere: reference it, do not define it
   // local
   int offset;
   // global data
-  char *init_data;   // non-NULL for string literals
+  char *init_data;   // the bytes, when there is an initialiser
   int init_len;
+  Relocation *rel;   // the places in those bytes that hold an address
   // function
   Obj *params;
   Obj *locals;
@@ -720,6 +735,7 @@ static Obj *new_string_literal(Token *t) {
   Obj *v = new_var(strdup(name), array_of(ty_char, t->str_len), false);
   v->init_data = t->str;
   v->init_len = t->str_len;
+  v->is_anon_str = true;
   return v;
 }
 
@@ -732,6 +748,7 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok);
 static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
 static Node *stmt(void);
 static Node *compound_stmt(void);
+static long eval(Node *n);
 static Type *declspec(VarAttr *attr);
 static Type *declarator(Type *ty, char **name);
 static Type *struct_union_decl(void);
@@ -812,6 +829,39 @@ static Type *declspec(VarAttr *attr) {
 // Trailing array dimensions: "[3][4]" applied right-to-left.
 // Fold an integer constant expression. Needed for enum values and array
 // dimensions, both of which must be known at compile time.
+// A constant expression whose value may be an address. *label comes back
+// non-NULL for "the address of that symbol, plus this much", which is the
+// only form a linker can resolve and therefore the only one a global
+// initialiser may contain beyond a plain number.
+//
+// Arrays, functions and string literals are their own addresses; everything
+// else has to be written with a & to get one.
+static long eval_addr(Node *n, char **label) {
+  switch (n->kind) {
+  case ND_ADD:   return eval_addr(n->lhs, label) + eval_addr(n->rhs, label);
+  case ND_SUB:   return eval_addr(n->lhs, label) - eval_addr(n->rhs, label);
+  case ND_CAST:  return eval_addr(n->lhs, label);
+  case ND_ADDR:
+    if (n->lhs->kind != ND_VAR || n->lhs->var->is_local)
+      error_at(n->tok->loc, "a global initialiser can only take the address of a global");
+    *label = n->lhs->var->name;
+    return 0;
+  case ND_VAR:
+    if (n->var->is_local)
+      error_at(n->tok->loc, "a global initialiser cannot refer to a local");
+    if (n->var->ty->kind != TY_ARRAY && !n->var->is_function)
+      error_at(n->tok->loc, "a global initialiser cannot read another variable");
+    *label = n->var->name;
+    return 0;
+  case ND_MEMBER:
+    // &s.field, reached through the ND_ADDR case above having unwrapped.
+    error_at(n->tok->loc, "a struct member is not a constant address here");
+    return 0;
+  default:
+    return eval(n);
+  }
+}
+
 static long eval(Node *n) {
   switch (n->kind) {
   case ND_NUM:    return n->val;
@@ -1112,6 +1162,89 @@ static char *static_local_name(char *name) {
   return s;
 }
 
+// ---- initialisers for objects in static storage --------------------------
+//
+// A local initialiser is lowered to assignments and run; a global one has to
+// exist before main does, so it is a byte pattern in the object file. Same
+// surface syntax, completely different mechanism, which is why this does not
+// share code with init_walk above.
+
+static void write_le(char *buf, long val, int size) {
+  for (int i = 0; i < size; i++)
+    buf[i] = (char)((unsigned long)val >> (i * 8));
+}
+
+static Relocation *add_rel(Relocation **list, int offset, char *label, long addend) {
+  Relocation *r = calloc(1, sizeof(Relocation));
+  r->offset = offset; r->label = label; r->addend = addend;
+  // Kept in increasing offset order so emission is one linear pass.
+  Relocation **p = list;
+  while (*p && (*p)->offset < offset) p = &(*p)->next;
+  r->next = *p;
+  *p = r;
+  return r;
+}
+
+// Fill buf[offset .. offset+ty->size) from the initialiser at the cursor.
+static void global_init(char *buf, Relocation **rel, Type *ty, int offset) {
+  if (ty->kind == TY_ARRAY) {
+    // "char s[] = \"abc\";" copies the bytes, rather than storing a pointer
+    // to them: the array IS the storage.
+    if (ty->base->kind == TY_CHAR && tk->kind == TK_STR) {
+      Token *t = tk;
+      tk = tk->next;
+      int n = t->str_len < ty->size ? t->str_len : ty->size;
+      memcpy(buf + offset, t->str, n);
+      return;
+    }
+    expect("{");
+    for (int i = 0; i < ty->array_len; i++) {
+      if (i > 0 && !consume(",")) break;
+      if (peek("}")) break;
+      global_init(buf, rel, ty->base, offset + i * ty->base->size);
+    }
+    consume(",");
+    expect("}");
+    return;
+  }
+
+  if (is_aggregate(ty)) {
+    expect("{");
+    for (Member *m = ty->members; m; m = m->next) {
+      if (m != ty->members && !consume(",")) break;
+      if (peek("}")) break;
+      global_init(buf, rel, m->ty, offset + m->offset);
+      if (ty->kind == TY_UNION) break;   // only the first member is initialised
+    }
+    consume(",");
+    expect("}");
+    return;
+  }
+
+  // A braced scalar is legal: "int x = {5};".
+  bool braced = consume("{");
+  Node *n = assign();
+  add_type(n);
+  if (braced) { consume(","); expect("}"); }
+
+  char *label = NULL;
+  long val = eval_addr(n, &label);
+  if (label) {
+    if (ty->size != 8)
+      error_at(n->tok->loc, "an address does not fit in %d bytes", ty->size);
+    add_rel(rel, offset, label, val);
+    return;     // the bytes stay zero; the linker writes them
+  }
+  write_le(buf + offset, val, ty->size);
+}
+
+// Parse "= ..." for an object in static storage and attach the result.
+static void read_static_init(Obj *var) {
+  var->init_data = calloc(1, var->ty->size ? var->ty->size : 1);
+  var->init_len = var->ty->size;
+  global_init(var->init_data, &var->rel, var->ty, 0);
+}
+
 // declaration = declspec declarator ("=" initialiser)? ("," ...)* ";"
 static Node *declaration(void) {
   VarAttr attr = {0};
@@ -1155,14 +1288,19 @@ static Node *declaration(void) {
     // only real work is giving it a name the assembler will not collide with
     // some other function's static of the same name.
     if (attr.is_static) {
+      if (peek("=") && ty->kind == TY_ARRAY && ty->array_len < 0) {
+        Token *eq = tk;
+        tk = tk->next;
+        int n = (tk->kind == TK_STR) ? tk->str_len : count_init_elems();
+        ty = array_of(ty->base, n);
+        tk = eq;
+      }
       Obj *var = new_var(static_local_name(name), ty, false);
       var->is_static = true;
       // new_var pushed the mangled name; the source name is what has to
       // resolve inside this block.
       push_scope(name)->var = var;
-      if (peek("="))
-        error_at(tk->loc, "an initialiser on a static local is not supported yet "
-                          "(needs global initialisers; see PLAN.md item 10)");
+      if (consume("=")) read_static_init(var);
       continue;
     }
 
@@ -1861,6 +1999,18 @@ static void global_variable(Type *base, VarAttr *attr) {
     char *name;
     Type *ty = declarator(base, &name);
     if (attr && attr->is_typedef) { push_scope(name)->type_def = ty; continue; }
+    // "int a[] = {1,2,3};" is only incomplete until the initialiser is read,
+    // so the length has to be settled before the type is judged and before
+    // the Obj that will carry its storage exists.
+    bool has_init = peek("=");
+    if (has_init && ty->kind == TY_ARRAY && ty->array_len < 0) {
+      Token *eq = tk;
+      tk = tk->next;
+      int n = (tk->kind == TK_STR) ? tk->str_len : count_init_elems();
+      ty = array_of(ty->base, n);
+      tk = eq;
+    }
+
     // An extern declaration names something defined in another translation
     // unit, so its size may well be unknown here and emitting storage for it
     // would create a second definition at link time.
@@ -1868,6 +2018,15 @@ static void global_variable(Type *base, VarAttr *attr) {
       error_at(tk->loc, "global has incomplete type");
     Obj *v = new_var(name, ty, false);
     if (attr) { v->is_static = attr->is_static; v->is_extern = attr->is_extern; }
+
+    if (consume("=")) {
+      // C11 6.9.2: a file-scope declaration with an initialiser IS a
+      // definition, and the extern becomes a statement about linkage only.
+      // Refusing this was the first thing refuse() caught in cc rather than
+      // in a test, because the helper makes gcc agree before a refusal counts.
+      v->is_extern = false;
+      read_static_init(v);
+    }
   }
 }
 
@@ -3373,13 +3532,27 @@ static void emit_data(Obj *globals_) {
     if (v->is_extern) continue;
 
     if (v->init_data) {
-      fprintf(out, "  .section .rodata\n");
+      // String literals are read-only; everything else may be written to.
+      fprintf(out, v->is_anon_str ? "  .section .rodata\n" : "  .data\n");
+      if (!v->is_static && !v->is_anon_str) fprintf(out, "  .globl %s\n", v->name);
       fprintf(out, "%s:\n", v->name);
-      for (int i = 0; i < v->init_len; i++)
+
+      Relocation *r = v->rel;
+      int i = 0;
+      while (i < v->init_len) {
+        if (r && r->offset == i) {
+          // Eight bytes the linker fills in, not eight bytes we know.
+          fprintf(out, "  .quad %s%+ld\n", r->label, r->addend);
+          r = r->next;
+          i += 8;
+          continue;
+        }
         fprintf(out, "  .byte %d\n", (unsigned char)v->init_data[i]);
+        i++;
+      }
       continue;
     }
-    fprintf(out, "  .data\n");
+    fprintf(out, "  .bss\n");
     if (!v->is_static) fprintf(out, "  .globl %s\n", v->name);
     fprintf(out, "%s:\n", v->name);
     fprintf(out, "  .zero %d\n", v->ty->size);

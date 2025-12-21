@@ -10,6 +10,11 @@ cd "$(dirname "$0")/.." || exit 1
 # FAILING while passing 168 of 168 on its own.
 T=t/tmp.$$
 
+# Which binary to exercise. test-asan points this at a sanitized build; the
+# cases are identical either way, because a memory bug in the compiler is not
+# a different test, it is the same test with something watching.
+CCBIN=${CCBIN:-./cc}
+
 pass=0
 fail=0
 
@@ -17,7 +22,7 @@ check() {
   expected="$1"
   src="$2"
   printf '%s' "$src" > "$T.c"
-  if ! ./cc "$T.c" -o "$T.bin" 2> "$T.err"; then
+  if ! "$CCBIN" "$T.c" -o "$T.bin" 2> "$T.err"; then
     fail=$((fail + 1))
     printf 'FAIL (compile) %s\n' "$src"
     sed 's/^/        /' "$T.err"
@@ -40,9 +45,21 @@ check() {
 refuse() {
   src="$1"
   printf '%s' "$src" > "$T.c"
-  if ./cc "$T.c" -o "$T.bin" 2> "$T.err"; then
+  "$CCBIN" "$T.c" -o "$T.bin" 2> "$T.err"
+  rc=$?
+  if [ "$rc" = 0 ]; then
     fail=$((fail + 1))
     printf 'FAIL (accepted, should refuse) %s\n' "$src"
+    return
+  fi
+  # Exactly 1, not merely non-zero. Under test-asan a sanitizer abort also
+  # exits non-zero, and "cc rejected it" and "cc crashed while rejecting it"
+  # would be the same observation -- which is how a whole sanitizer build can
+  # silently stop meaning anything. ASAN_OPTIONS=exitcode=86 keeps them apart.
+  if [ "$rc" != 1 ]; then
+    fail=$((fail + 1))
+    printf 'FAIL (exit %s, not a clean refusal) %s\n' "$rc" "$src"
+    sed 's/^/        /' "$T.err"
     return
   fi
   if gcc -w -c "$T.c" -o /dev/null 2> /dev/null; then
@@ -356,7 +373,7 @@ link_static_test() {
   printf 'static int g;\nint set_b(int v){ g=v; return g; }\nint get_b(void){ return g; }\n' > "$d/b.c"
   printf 'int set_a(int); int get_a(void); int set_b(int); int get_b(void);\nint main(void){ set_a(1); set_b(2); return get_a()*10 + get_b(); }\n' > "$d/m.c"
   for f in a b m; do
-    ./cc -S "$d/$f.c" -o "$d/$f.s" 2> "$d/err" || {
+    "$CCBIN" -S "$d/$f.c" -o "$d/$f.s" 2> "$d/err" || {
       fail=$((fail + 1)); printf 'FAIL (compile) static linkage: %s.c\n' "$f"; rm -rf "$d"; return; }
   done
   if ! gcc -static "$d/a.s" "$d/b.s" "$d/m.s" -o "$d/bin" 2> "$d/lderr"; then
@@ -375,6 +392,49 @@ link_static_test() {
   rm -rf "$d"
 }
 link_static_test
+
+# --- global initialisers (PLAN 10)
+check 7   'int x = 7; int main(){ return x; }'
+check 1   'long x = -1; int main(){ return x == -1; }'
+check 65  "char c = 'A'; int main(){ return c; }"
+check 7   'int x = 2*3+1; int main(){ return x; }'
+check 6   'int a[3] = {1,2,3}; int main(){ return a[0]+a[1]+a[2]; }'
+check 18  'int a[] = {4,5,6}; int main(){ return sizeof(a)/4*a[2]; }'
+check 3   'int a[4] = {1,2}; int main(){ return a[0]+a[1]+a[2]+a[3]; }'
+check 4   'int a[2][2] = {{1,2},{3,4}}; int main(){ return a[1][1]; }'
+check 0   'char s[] = "hi"; int main(){ return s[0]+s[1]-209; }'
+check 0   'char s[8] = "hi"; int main(){ return sizeof(s)+s[0]-112; }'
+# A string longer than the array it initialises is truncated, and the NUL is
+# dropped with it (C11 6.7.9p14). Under `make test-asan` this is also the
+# case that proves the copy is bounded: without the clamp it is a heap
+# overflow in the compiler, which the ordinary build cannot see because the
+# bytes it tramples are not ones the output depends on.
+check 57  'char s[3] = "hello"; int main(){ return s[0]+s[1]+s[2]; }'
+check 0   'struct P { int x; int y; }; struct P p = {3,4}; int main(){ return p.x*p.y-12; }'
+check 6   'enum { E = 6 }; int x = E; int main(){ return x; }'
+check 8   'int n = sizeof(long); int main(){ return n; }'
+check 5   'static int g = 5; int main(){ return g; }'
+check 12  'int f(void){ static int n = 10; n=n+1; return n; } int main(){ f(); return f(); }'
+check 6   'int f(void){ static int a[] = {5,6}; return a[1]; } int main(){ return f(); }'
+
+# An address is not a byte pattern. These are the cases that need a
+# relocation: the linker, not the compiler, writes those eight bytes.
+check 97  'char *p = "abc"; int main(){ return p[0]; }'
+check 9   'int v = 9; int *p = &v; int main(){ return *p; }'
+check 3   'int a[3] = {1,2,3}; int *p = a; int main(){ return p[2]; }'
+check 3   'int a[4] = {1,2,3,4}; int *p = a + 2; int main(){ return *p; }'
+check 255 'char *a[] = {"xy","z"}; int main(){ return a[0][0]+a[1][0]-243; }'
+
+# The shape cc.c uses for its own keyword table.
+check 2   'char *K[] = {"a","bb",0}; int main(){ int n=0; while(K[n]) n=n+1; return n; }'
+
+# An extern declaration with an initialiser is a definition (C11 6.9.2),
+# not an error: the extern then says something about linkage and nothing
+# about whether this file defines the object.
+check 1   'extern int e = 1; int main(){ return e; }'
+# A global initialiser must be computable before main runs.
+refuse 'int f(void){ return 1; } int g = f(); int main(){ return g; }'
+refuse 'int main(){ int local = 1; return local; } int g = local;'
 
 #__APPEND_BELOW__
 
