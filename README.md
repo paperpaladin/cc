@@ -63,6 +63,11 @@ uninitialised stack.
 **Calls** -- definitions and calls up to 6 arguments, recursion, and calls into
 libc that get the ABI right.
 
+**Variadic definitions** -- `int sum(int n, ...)` with the SysV register
+save area, plus `va_list`, `va_start`, `va_arg`, `va_end` and `va_copy`
+predefined, so none of it needs a header. The real `<stdarg.h>` is GNU C
+from its first line, which is exactly the dependency this avoids.
+
 **Global initialisers** -- scalars, arrays, nested arrays, structs, strings
 into `char` arrays, and addresses: `char *p = "abc"`, `int *p = &v`, `int *p
 = a + 2`, and tables like `char *K[] = {"a","bb",0}`. An address is not a
@@ -99,7 +104,9 @@ A stray backslash outside a string literal is rejected rather than carried
 along as a preprocessing token, which is legal C that real preprocessors
 accept; nothing here needs it, and the tokenizer is simpler without it.
 
-No `float` or `double`. No bitfields. No variadic function
+No `float` or `double`. No bitfields. No `va_arg` of a struct.
+A call may pass at most six arguments (a definition may *receive* more than
+six through `va_arg`, which is how the overflow path gets tested at all). No variadic function
 *definitions* (calling a variadic function works). Passing or returning a struct
 **by value** is rejected with an explicit error rather than silently
 miscompiled -- that needs the SysV eightbyte classification algorithm, which is
@@ -293,13 +300,42 @@ holds. Under the sanitizer build the same case is a heap-buffer-overflow and
 the mutant dies. A test that drives the code over the bug and checks the
 answer is not the same as a test that checks the bug did not happen.
 
-One mutant is left alive deliberately. Replacing `calloc` with `malloc` in
+### Testing an ABI you are only half of
+
+Variadic functions were the first feature where the interesting cases could
+not be written in the language being compiled.
+
+The real oracle is **glibc**. `vsprintf(buf, fmt, ap)` hands our `va_list`
+to a library that was compiled years ago by a different compiler and walks
+it with its own `va_arg`. If the struct layout, the starting `gp_offset`, or
+the register save area are wrong by one field, glibc reads someone else's
+memory instead of our arguments. No assertion we could write about our own
+data structures comes close.
+
+The second case runs the other way. `va_arg`'s overflow branch -- arguments
+seven and beyond, which arrive on the stack rather than in registers -- is
+unreachable from any program this compiler builds, because its own call path
+stops at six arguments. So the suite has gcc make the call: gcc compiles a
+`main` that passes nine arguments to a variadic function **we** compiled,
+and links them together. Their calling convention, our prologue, our
+`va_arg`. Delete the `jae` that chooses the overflow path and only that one
+case fails.
+
+Two mutants are left alive deliberately. Replacing `calloc` with `malloc` in
 the initialiser buffer should break partial initialisation -- `int a[4] =
 {1,2}` must zero the rest -- and does not, because this compiler never frees
 anything, so every allocation is a fresh page the kernel has already zeroed.
 The line is still correct and still required the moment any of that changes.
 Nothing in this suite can distinguish it, and saying so is better than
 pretending the coverage is complete.
+
+The second is `va_list`: it is an array of one struct, per the ABI, and
+making it a plain struct changes nothing here. `is_address_valued()` is true
+for every aggregate in this compiler, so a struct yields its address exactly
+as an array does. The array is still correct and still what C specifies; it
+simply stops mattering until aggregates can be passed by value. The first
+version of this comment claimed the struct form would silently pass a copy,
+which was a confident explanation of something that does not happen.
 
 ## License
 

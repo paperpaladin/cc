@@ -414,6 +414,7 @@ typedef enum {
   ND_AND, ND_OR, ND_NOT, ND_BITAND, ND_BITOR, ND_BITXOR, ND_BITNOT,
   ND_SHL, ND_SHR, ND_COND, ND_COMMA, ND_CAST, ND_MEMBER,
   ND_RETURN, ND_IF, ND_FOR, ND_DO, ND_BLOCK, ND_FUNCALL, ND_EXPR_STMT,
+  ND_VA_START, ND_VA_ARG,
   ND_BREAK, ND_CONTINUE, ND_SWITCH, ND_CASE, ND_GOTO, ND_LABEL,
 } NodeKind;
 
@@ -455,6 +456,7 @@ struct Obj {
   Node *body;
   int stack_size;
   bool is_variadic;   // declared with a trailing "..."
+  int va_area;        // rbp-relative base of the register save area
   bool has_proto;     // "f(void)" or "f(int)" promise an argument list;
                       // "f()" in C promises nothing, so it is not checked
 };
@@ -1467,6 +1469,39 @@ static Node *primary(void) {
   }
 
   if (tk->kind == TK_IDENT) {
+    // The two builtins. They are not calls: va_start writes four fields of a
+    // struct the caller owns, and va_arg's second operand is a TYPE, which
+    // no function signature can describe.
+    if (tok_is(tk, "__builtin_va_start")) {
+      tk = tk->next;
+      expect("(");
+      Node *n = new_node(ND_VA_START, tok);
+      n->lhs = assign();
+      add_type(n->lhs);
+      // The second argument names the last fixed parameter. Its only job is
+      // to say how many register slots are already spoken for, and that is
+      // known from the declaration, so the expression is parsed and dropped.
+      if (consume(",")) { assign(); }
+      expect(")");
+      n->ty = ty_void;
+      return n;
+    }
+    if (tok_is(tk, "__builtin_va_arg")) {
+      tk = tk->next;
+      expect("(");
+      Node *n = new_node(ND_VA_ARG, tok);
+      n->lhs = assign();
+      add_type(n->lhs);
+      expect(",");
+      Type *ty = typename_();
+      expect(")");
+      if (is_aggregate(ty))
+        error_at(tok->loc, "va_arg of a struct or union is not supported "
+                           "(needs SysV eightbyte classification; see PLAN.md)");
+      n->ty = ty;
+      return n;
+    }
+
     char *name = get_ident();
     if (consume("(")) return funcall(name, tok);
 
@@ -1982,6 +2017,14 @@ static Obj *function(Type *base, VarAttr *attr) {
   }
 
   int off = 0;
+  // A variadic function must be able to hand out arguments that arrived in
+  // registers, and registers are not addressable. The ABI's answer is to
+  // spill all six on entry into a known block and point va_list at it.
+  // 48 bytes, no floats, so the fp half is never touched.
+  if (fn->is_variadic) {
+    off = 48;
+    fn->va_area = -off;
+  }
   for (Obj *v = fn->locals; v; v = v->next) {
     off += v->ty->size;
     off = align_to(off, v->ty->size > 8 ? 8 : v->ty->size);
@@ -2042,9 +2085,42 @@ static bool is_function_decl(void) {
   return r;
 }
 
+// The SysV x86-64 va_list, constructed rather than parsed, because there is
+// no header to read it from and its layout is fixed by the ABI anyway:
+//
+//   struct { unsigned gp_offset, fp_offset; char *overflow_arg_area, *reg_save_area; }
+//
+// va_list is an ARRAY of one of those, not the struct itself, because
+// "vfprintf(out, fmt, ap)" has to hand glibc the ADDRESS of the struct so
+// that glibc's own va_arg advances the caller's copy rather than a duplicate.
+//
+// This compiler cannot actually tell the two apart: is_address_valued() is
+// true for every aggregate, so a plain struct would yield its address here
+// too, and that mutation survives the suite. The array is still what C and
+// the ABI specify, and it is what stops this from breaking the moment
+// aggregates learn to be passed by value (PLAN 13).
+static Type *make_va_list_type(void) {
+  Member *gp = calloc(1, sizeof(Member));
+  gp->name = "gp_offset"; gp->ty = ty_uint; gp->offset = 0;
+  Member *fp = calloc(1, sizeof(Member));
+  fp->name = "fp_offset"; fp->ty = ty_uint; fp->offset = 4;
+  Member *ov = calloc(1, sizeof(Member));
+  ov->name = "overflow_arg_area"; ov->ty = pointer_to(ty_char); ov->offset = 8;
+  Member *rs = calloc(1, sizeof(Member));
+  rs->name = "reg_save_area"; rs->ty = pointer_to(ty_char); rs->offset = 16;
+  gp->next = fp; fp->next = ov; ov->next = rs;
+
+  Type *st = calloc(1, sizeof(Type));
+  st->kind = TY_STRUCT; st->size = 24; st->align = 8; st->members = gp;
+  return array_of(st, 1);
+}
+
 static Obj *parse(Token *t) {
   tk = t;
   globals = NULL;
+  enter_scope();
+  push_scope("va_list")->type_def = make_va_list_type();
+  push_scope("__builtin_va_list")->type_def = make_va_list_type();
   while (tk->kind != TK_EOF) {
     VarAttr attr = {0};
     Type *base = declspec(&attr);
@@ -2123,6 +2199,7 @@ static int n_include_paths;
 
 static Token *preprocess2(Token *tok);
 static Token *copy_token(Token *t);
+static void read_macro_definition(Token **rest, Token *tok);
 
 // A NUL-terminated copy of a token's spelling.
 static char *tok_text(Token *t) {
@@ -2794,9 +2871,30 @@ static Token *builtin_line(Token *tok) {
   return t;
 }
 
+// Predefine a macro from source text, so a built-in definition goes through
+// exactly the same parser a #define does.
+static void define_text(char *text) {
+  Token *t = tokenize_string("<built-in>", text);
+  Token *rest;
+  read_macro_definition(&rest, t);
+}
+
 static void init_macros(void) {
   add_builtin("__FILE__", builtin_file);
   add_builtin("__LINE__", builtin_line);
+
+  // <stdarg.h> is three macros over compiler builtins and a typedef, and the
+  // typedef is already in the parser's file scope. Providing them here means
+  // a variadic function needs no header at all, which matters because the
+  // real one is GNU C from its first line.
+  define_text("va_start(ap, last) __builtin_va_start(ap, last)");
+  define_text("va_arg(ap, ty) __builtin_va_arg(ap, ty)");
+  define_text("va_end(ap) ((void)0)");
+  define_text("va_copy(d, s) ((void)((d)[0] = (s)[0]))");
+
+  define_text("__STDC__ 1");
+  define_text("__x86_64__ 1");
+  define_text("__linux__ 1");
 }
 
 // ---- #define --------------------------------------------------------------
@@ -3317,6 +3415,49 @@ static void gen_expr(Node *n) {
     fprintf(out, ".L.end.%d:\n", c);
     return;
   }
+  case ND_VA_START: {
+    // ap is an array of one struct, so evaluating it yields its address.
+    gen_expr(n->lhs);
+    int named = 0;
+    for (Obj *pv = current_fn->params; pv; pv = pv->next) named++;
+    // gp_offset starts past the slots the named parameters occupy, so the
+    // first va_arg returns the first argument the caller actually added.
+    emit("movl $%d, (%%rax)", named * 8);
+    emit("movl $48, 4(%%rax)");          // no float registers are ever used
+    // Arguments seven and beyond were pushed by the caller and live above
+    // the return address: rbp+16 is the first of them.
+    emit("lea 16(%%rbp), %%rdi");
+    emit("mov %%rdi, 8(%%rax)");
+    emit("lea %d(%%rbp), %%rdi", current_fn->va_area);
+    emit("mov %%rdi, 16(%%rax)");
+    return;
+  }
+  case ND_VA_ARG: {
+    gen_expr(n->lhs);                     // rax = &va_list
+    int lbl = label_id++;
+    // if (gp_offset < 48) take it from the register save area, else from
+    // the overflow area. The branch is the whole of va_arg.
+    emit("movl (%%rax), %%ecx");
+    emit("cmp $48, %%ecx");
+    emit("jae .L.va.over.%d", lbl);
+    emit("mov 16(%%rax), %%rdx");         // reg_save_area
+    emit("add %%rcx, %%rdx");
+    emit("add $8, %%ecx");
+    emit("movl %%ecx, (%%rax)");
+    emit("jmp .L.va.done.%d", lbl);
+    emit(".L.va.over.%d:", lbl);
+    emit("mov 8(%%rax), %%rdx");          // overflow_arg_area
+    emit("lea 8(%%rdx), %%rcx");
+    emit("mov %%rcx, 8(%%rax)");
+    emit(".L.va.done.%d:", lbl);
+    // Every integer argument occupies a full eight-byte slot, so a narrower
+    // type is the low bytes of one rather than a tighter load.
+    if (n->ty->size == 1)      emit(n->ty->is_unsigned ? "movzbl (%%rdx), %%eax" : "movsbl (%%rdx), %%eax");
+    else if (n->ty->size == 2) emit(n->ty->is_unsigned ? "movzwl (%%rdx), %%eax" : "movswl (%%rdx), %%eax");
+    else if (n->ty->size == 4) emit("movl (%%rdx), %%eax");
+    else                       emit("mov (%%rdx), %%rax");
+    return;
+  }
   case ND_FUNCALL: {
     int nargs = 0;
     for (Node *a = n->args; a; a = a->next) {
@@ -3572,6 +3713,14 @@ static void emit_text(Obj *globals_) {
     emit("push %%rbp");
     emit("mov %%rsp, %%rbp");
     if (fn->stack_size) emit("sub $%d, %%rsp", fn->stack_size);
+
+    // All six, unconditionally, before the named ones are spilled to their
+    // own slots. The named arguments are therefore stored twice, which is
+    // what the ABI asks for: the save area has to be a contiguous image of
+    // the registers so that va_arg can index into it by offset.
+    if (fn->is_variadic)
+      for (int i = 0; i < 6; i++)
+        emit("mov %s, %d(%%rbp)", ARGREG64[i], fn->va_area + i * 8);
 
     // fn->params is already in declaration order, so param k lives in
     // ARGREG*[k]. Spill each to its stack slot on entry.

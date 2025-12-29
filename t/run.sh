@@ -393,6 +393,34 @@ link_static_test() {
 }
 link_static_test
 
+# The va_arg overflow path cannot be reached from a program this compiler
+# builds, because its own call path stops at six arguments. gcc has no such
+# limit, so gcc makes the nine-argument call into a variadic function we
+# compiled: its calling convention, our prologue, our va_arg. Arguments one
+# to six arrive in registers and seven to nine on the stack, which is the
+# only way that branch ever executes.
+cross_variadic_test() {
+  d=$T.vadir
+  rm -rf "$d"; mkdir -p "$d"
+  printf 'long vsum(int n, ...){ va_list ap; va_start(ap,n); long t=0; int i; for(i=0;i<n;i=i+1) t=t+va_arg(ap,long); va_end(ap); return t; }\n' > "$d/ours.c"
+  printf 'long vsum(int n, ...);\nint main(void){ return !(vsum(3,1L,2L,3L)==6 && vsum(9,1L,2L,3L,4L,5L,6L,7L,8L,9L)==45); }\n' > "$d/theirs.c"
+  if ! "$CCBIN" -S "$d/ours.c" -o "$d/ours.s" 2> "$d/err"; then
+    fail=$((fail + 1)); printf 'FAIL (compile) cross-compiler variadic\n'; sed 's/^/        /' "$d/err"; rm -rf "$d"; return
+  fi
+  if ! gcc -w -static "$d/ours.s" "$d/theirs.c" -o "$d/bin" 2> "$d/lderr"; then
+    fail=$((fail + 1)); printf 'FAIL (link) cross-compiler variadic\n'; sed 's/^/        /' "$d/lderr"; rm -rf "$d"; return
+  fi
+  "$d/bin"; got=$?
+  if [ "$got" = 0 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  gcc calling our variadic function with 9 arguments (got %s)\n' "$got"
+  fi
+  rm -rf "$d"
+}
+cross_variadic_test
+
 # --- global initialisers (PLAN 10)
 check 7   'int x = 7; int main(){ return x; }'
 check 1   'long x = -1; int main(){ return x == -1; }'
@@ -435,6 +463,20 @@ check 1   'extern int e = 1; int main(){ return e; }'
 # A global initialiser must be computable before main runs.
 refuse 'int f(void){ return 1; } int g = f(); int main(){ return g; }'
 refuse 'int main(){ int local = 1; return local; } int g = local;'
+
+# --- variadic definitions (PLAN 11)
+# va_list is predefined and va_start/va_arg/va_end are built-in macros, so
+# none of this needs a header -- which matters, because the real <stdarg.h>
+# is GNU C from its first line.
+check 100 'int sum(int n, ...){ va_list ap; va_start(ap,n); int t=0; int i; for(i=0;i<n;i=i+1) t=t+va_arg(ap,int); va_end(ap); return t; } int main(){ return sum(4,10,20,30,40); }'
+check 0   'int sum(int n, ...){ va_list ap; va_start(ap,n); int t=0; int i; for(i=0;i<n;i=i+1) t=t+va_arg(ap,int); return t; } int main(){ return sum(0); }'
+check 6   'long s(int n, ...){ va_list ap; va_start(ap,n); long t=0; int i; for(i=0;i<n;i=i+1) t=t+va_arg(ap,long); return t; } int main(){ return s(3,1,2,3); }'
+check 1   'int f(int n, ...){ va_list ap; va_start(ap,n); char c = va_arg(ap,int); return c == 65; } int main(){ return f(1,65); }'
+
+# The strongest oracle available: hand our va_list to glibc and let its own
+# va_arg walk it. If the layout or the offsets are wrong, vsprintf reads
+# someone else'"'"'s memory rather than our arguments.
+check 0   'int lg(char *b, char *f, ...){ va_list ap; va_start(ap,f); int n=vsprintf(b,f,ap); va_end(ap); return n; } int main(){ char b[64]; int n=lg(b,"%d/%s/%c",42,"mid",65); if(n!=8) return 1; return strcmp(b,"42/mid/A"); }'
 
 #__APPEND_BELOW__
 
