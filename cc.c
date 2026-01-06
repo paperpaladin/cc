@@ -36,9 +36,41 @@ static File *files;   // every file read so far, newest first
 
 static char *read_file(char *path);
 
+// Translation phase 2: a backslash immediately before a newline splices the
+// two lines into one. Done on the buffer rather than in the tokenizer
+// because it is not a lexical rule -- it happens before anything is a token,
+// which is why it can appear in the middle of a string literal or an
+// identifier and still work.
+//
+// The deleted newlines are not simply dropped: the same number are put back
+// at the end of the logical line, so every later line keeps the number it
+// has in the file the user is looking at. Getting that wrong makes every
+// diagnostic in a header full of continuations point at the wrong place.
+static void splice_lines(char *p) {
+  char *in = p, *out = p;
+  int pending = 0;
+
+  while (*in) {
+    if (in[0] == '\\' && in[1] == '\n') {
+      in += 2;
+      pending++;
+      continue;
+    }
+    if (*in == '\n') {
+      *out++ = *in++;
+      while (pending) { *out++ = '\n'; pending--; }
+      continue;
+    }
+    *out++ = *in++;
+  }
+  while (pending) { *out++ = '\n'; pending--; }
+  *out = 0;
+}
+
 static File *new_file(char *name, char *text) {
   File *f = calloc(1, sizeof(File));
   f->name = name;
+  splice_lines(text);
   f->text = text;
   f->len  = strlen(text);
   f->next = files;
@@ -775,12 +807,37 @@ static bool is_typename(void) {
 // We accept the common multi-word spellings ("long long", "unsigned" is not
 // supported) and collapse them to one of our five base types.
 static Type *declspec(VarAttr *attr) {
-  // Storage class first, and it may appear before or after the type keywords.
-  for (;;) {
+  // C lets the specifiers of a declaration appear in any order, so
+  // "long unsigned int", "unsigned long" and "int unsigned long" all name
+  // the same type. Positional parsing gets the common spellings and then
+  // fails on a real header: glibc's stddef.h writes "long unsigned int".
+  //
+  // So each keyword adds to a counter instead, and the total names the type.
+  // LONG adds 1<<10 so that a second "long" lands on its own bit rather than
+  // colliding with anything, which is what makes "long long" fall out
+  // without a special case.
+  enum {
+    M_VOID     = 1 << 0,
+    M_BOOL     = 1 << 2,
+    M_CHAR     = 1 << 4,
+    M_SHORT    = 1 << 6,
+    M_INT      = 1 << 8,
+    M_LONG     = 1 << 10,
+    M_OTHER    = 1 << 12,
+    M_SIGNED   = 1 << 13,
+    M_UNSIGNED = 1 << 14,
+  };
+
+  Type *ty = ty_int;
+  int counter = 0;
+
+  while (is_typename()) {
+    // Storage classes may appear anywhere among the specifiers, including
+    // after them: "int static x;" is legal, if unloved.
     if (peek("typedef")) {
       if (!attr) error_at(tk->loc, "typedef is not allowed here");
-      tk = tk->next;
       attr->is_typedef = true;
+      tk = tk->next;
       continue;
     }
     if (peek("static") || peek("extern")) {
@@ -791,40 +848,72 @@ static Type *declspec(VarAttr *attr) {
       tk = tk->next;
       continue;
     }
-    break;
+
+    // A tag or a typedef name is a complete type on its own, and cannot be
+    // combined with the keywords above.
+    if (peek("struct") || peek("union") || peek("enum") || find_typedef(tk)) {
+      if (counter) break;
+      if (peek("struct") || peek("union")) ty = struct_union_decl();
+      else if (peek("enum")) ty = enum_decl();
+      else { ty = find_typedef(tk); tk = tk->next; }
+      counter += M_OTHER;
+      continue;
+    }
+
+    if (consume("void"))          counter += M_VOID;
+    else if (consume("_Bool"))    counter += M_BOOL;
+    else if (consume("char"))     counter += M_CHAR;
+    else if (consume("short"))    counter += M_SHORT;
+    else if (consume("int"))      counter += M_INT;
+    else if (consume("long"))     counter += M_LONG;
+    else if (consume("signed"))   counter |= M_SIGNED;
+    else if (consume("unsigned")) counter |= M_UNSIGNED;
+    else break;
+
+    switch (counter) {
+    case M_VOID:
+      ty = ty_void; break;
+    case M_BOOL:
+      ty = ty_bool; break;
+    case M_CHAR:
+    case M_SIGNED + M_CHAR:
+      ty = ty_char; break;
+    case M_UNSIGNED + M_CHAR:
+      ty = ty_uchar; break;
+    case M_SHORT:
+    case M_SHORT + M_INT:
+    case M_SIGNED + M_SHORT:
+    case M_SIGNED + M_SHORT + M_INT:
+      ty = ty_short; break;
+    case M_UNSIGNED + M_SHORT:
+    case M_UNSIGNED + M_SHORT + M_INT:
+      ty = ty_ushort; break;
+    case M_INT:
+    case M_SIGNED:
+    case M_SIGNED + M_INT:
+      ty = ty_int; break;
+    case M_UNSIGNED:
+    case M_UNSIGNED + M_INT:
+      ty = ty_uint; break;
+    case M_LONG:
+    case M_LONG + M_INT:
+    case M_LONG + M_LONG:
+    case M_LONG + M_LONG + M_INT:
+    case M_SIGNED + M_LONG:
+    case M_SIGNED + M_LONG + M_INT:
+    case M_SIGNED + M_LONG + M_LONG:
+    case M_SIGNED + M_LONG + M_LONG + M_INT:
+      ty = ty_long; break;
+    case M_UNSIGNED + M_LONG:
+    case M_UNSIGNED + M_LONG + M_INT:
+    case M_UNSIGNED + M_LONG + M_LONG:
+    case M_UNSIGNED + M_LONG + M_LONG + M_INT:
+      ty = ty_ulong; break;
+    default:
+      error_at(tk->loc, "these type specifiers cannot be combined");
+    }
   }
 
-  // "unsigned" and "signed" may stand alone (meaning int) or qualify a width.
-  bool is_unsigned = false, saw_sign = false;
-  while (peek("unsigned") || peek("signed")) {
-    is_unsigned = peek("unsigned");
-    saw_sign = true;
-    tk = tk->next;
-  }
-
-  Type *ty = NULL;
-  if (consume("void")) ty = ty_void;
-  else if (consume("_Bool")) ty = ty_bool;
-  else if (consume("char")) ty = is_unsigned ? ty_uchar : ty_char;
-  else if (consume("short")) { consume("int"); ty = is_unsigned ? ty_ushort : ty_short; }
-  else if (consume("long")) { consume("long"); consume("int"); ty = is_unsigned ? ty_ulong : ty_long; }
-  else if (consume("int")) ty = is_unsigned ? ty_uint : ty_int;
-  else if (saw_sign) ty = is_unsigned ? ty_uint : ty_int;   // bare "unsigned"
-  else if (peek("struct") || peek("union")) ty = struct_union_decl();
-  else if (peek("enum")) ty = enum_decl();
-  else {
-    Type *td = find_typedef(tk);
-    if (!td) error_at(tk->loc, "expected a type name");
-    tk = tk->next;
-    ty = td;
-  }
-
-  // Trailing storage class: "int typedef x;" is legal, if unloved.
-  while (peek("typedef")) {
-    if (!attr) error_at(tk->loc, "typedef is not allowed here");
-    tk = tk->next;
-    attr->is_typedef = true;
-  }
   return ty;
 }
 
@@ -2329,6 +2418,9 @@ static Token *append(Token *a, Token *b) {
 // a File so that an error inside a paste still gets a caret, pointing at the
 // generated text, which is the only place the bad token actually exists.
 static Token *tokenize_string(char *name, char *text) {
+  // strdup because new_file splices line continuations in place, and some
+  // callers here hand over a string literal -- the predefined macros do.
+  text = strdup(text);
   File *sf = tk_file;
   int sl = tk_line;
   bool sb = tk_bol, ss = tk_space;
@@ -2879,6 +2971,23 @@ static void define_text(char *text) {
   read_macro_definition(&rest, t);
 }
 
+// Where <...> is looked for when -I says nothing. The gcc-internal directory
+// is first because it owns stddef.h, stdarg.h and friends, which /usr/include
+// expects to be supplied by the compiler rather than by libc.
+static void init_include_paths(void) {
+  static char *defaults[] = {
+    "/usr/local/include",
+    "/usr/lib/gcc/x86_64-redhat-linux/15/include",
+    "/usr/lib/gcc/x86_64-linux-gnu/14/include",
+    "/usr/include/x86_64-linux-gnu",
+    "/usr/include",
+    NULL,
+  };
+  for (int i = 0; defaults[i]; i++)
+    if (n_include_paths < (int)(sizeof(include_paths) / sizeof(*include_paths)))
+      include_paths[n_include_paths++] = defaults[i];
+}
+
 static void init_macros(void) {
   add_builtin("__FILE__", builtin_file);
   add_builtin("__LINE__", builtin_line);
@@ -3174,6 +3283,7 @@ static void print_tokens(Token *tok, char *path) {
 // string -- the two literals were correctly concatenated, one phase too early
 // for anyone to see them.
 static Token *preprocess(Token *tok) {
+  init_include_paths();
   init_macros();
   tok = preprocess2(tok);
   if (cond_incl)
