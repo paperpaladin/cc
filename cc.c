@@ -285,7 +285,11 @@ static Token *tokenize(File *file) {
 
     if (isdigit((unsigned char)*p)) {
       char *start = p;
-      long v = strtol(p, &p, 0);
+      // strtoul, not strtol: a literal is never negative here (unary minus is
+      // a separate node), and the range that matters is the full 64 bits.
+      // strtol saturates at LONG_MAX, so 18446744073709551615 silently
+      // became 9223372036854775807 rather than the bit pattern it names.
+      long v = (long)strtoul(p, &p, 0);
       while (*p == 'u' || *p == 'U' || *p == 'l' || *p == 'L') p++;  // ignore suffixes
       cur = cur->next = new_token(TK_NUM, start, p);
       cur->val = v;
@@ -377,6 +381,12 @@ struct Member {
   char *name;
   Type *ty;
   int offset;
+  // Bitfields. offset still names the storage unit this member is read
+  // through; bit_offset is where inside it the value starts, counting from
+  // the least significant bit, and bit_width is how many bits it is.
+  bool is_bitfield;
+  int bit_offset;
+  int bit_width;
 };
 
 static int align_to(int n, int a);
@@ -791,8 +801,30 @@ static long const_expr(void);
 
 static char *TYPE_KEYWORDS[] = {
   "int", "char", "long", "short", "void", "unsigned", "signed", "_Bool",
-  "struct", "union", "enum", "typedef", "static", "extern", NULL,
+  "struct", "union", "enum", "typedef", "static", "extern",
+  "const", "volatile", "restrict", "__restrict", "__restrict__",
+  "inline", "__inline", "__inline__", "_Noreturn",
+  NULL,
 };
+
+// Qualifiers this compiler parses and then ignores. const and volatile are
+// not enforced -- there is no const-checking here and saying so is better
+// than pretending -- and restrict is an optimisation promise to a code
+// generator that does not use it. Skipping them is what lets a real header
+// declare "void *memcpy(void *__restrict, const void *__restrict, size_t)".
+static bool skip_qualifiers(void) {
+  static char *QUALS[] = {
+    "const", "volatile", "restrict", "__restrict", "__restrict__",
+    "inline", "__inline", "__inline__", "_Noreturn", NULL,
+  };
+  bool any = false;
+  for (;;) {
+    int i = 0;
+    for (; QUALS[i]; i++)
+      if (peek(QUALS[i])) { tk = tk->next; any = true; break; }
+    if (!QUALS[i]) return any;
+  }
+}
 
 // A declaration can start with a type keyword, a storage class, or a name that
 // an enclosing scope made into a typedef. That last case is why this needs the
@@ -832,6 +864,8 @@ static Type *declspec(VarAttr *attr) {
   int counter = 0;
 
   while (is_typename()) {
+    if (skip_qualifiers()) continue;
+
     // Storage classes may appear anywhere among the specifiers, including
     // after them: "int static x;" is legal, if unloved.
     if (peek("typedef")) {
@@ -1000,7 +1034,8 @@ static Type *type_suffix(Type *ty) {
 }
 
 static Type *declarator(Type *ty, char **name) {
-  while (consume("*")) ty = pointer_to(ty);
+  skip_qualifiers();
+  while (consume("*")) { ty = pointer_to(ty); skip_qualifiers(); }
   *name = get_ident();
   return type_suffix(ty);
 }
@@ -1040,13 +1075,34 @@ static Type *struct_union_decl(void) {
     while (!consume(";")) {
       if (!first) expect(",");
       first = false;
-      char *name;
-      Type *mty = declarator(base, &name);
-      if (mty->kind == TY_VOID) error_at(tk->loc, "member declared void");
-      if (mty->size < 0) error_at(tk->loc, "member has incomplete type");
+      // An unnamed bitfield is legal and common: "int :3;" is padding and
+      // "int :0;" forces the next member to a fresh storage unit.
+      char *name = NULL;
+      Type *mty = base;
+      if (!peek(":")) {
+        mty = declarator(base, &name);
+        if (mty->kind == TY_VOID) error_at(tk->loc, "member declared void");
+        if (mty->size < 0) error_at(tk->loc, "member has incomplete type");
+      }
+
       Member *m = calloc(1, sizeof(Member));
       m->name = name;
       m->ty = mty;
+
+      if (consume(":")) {
+        if (!is_integer(mty))
+          error_at(tk->loc, "a bitfield must have an integer type");
+        m->is_bitfield = true;
+        m->bit_width = (int)const_expr();
+        if (m->bit_width < 0 || m->bit_width > mty->size * 8)
+          error_at(tk->loc, "a %d-bit field does not fit in %d bits",
+                   m->bit_width, mty->size * 8);
+        if (m->bit_width == 0 && name)
+          error_at(tk->loc, "a zero-width bitfield cannot have a name");
+      } else if (!name) {
+        error_at(tk->loc, "a member needs a name unless it is a bitfield");
+      }
+
       cur = cur->next = m;
     }
   }
@@ -1056,18 +1112,37 @@ static Type *struct_union_decl(void) {
   // a struct packs them in order with each one aligned, then rounds the total up
   // to the struct's own alignment so arrays of it stay aligned.
   int offset = 0;
+  int bits = 0;        // bits used so far in the current storage unit
   for (Member *m = ty->members; m; m = m->next) {
     if (is_union) {
       m->offset = 0;
+      if (m->is_bitfield) { m->bit_offset = 0; }
       if (ty->size < m->ty->size) ty->size = m->ty->size;
+    } else if (m->is_bitfield && m->bit_width == 0) {
+      // ":0" has no storage and no name. Its only job is to end the current
+      // unit, so whatever comes next starts at a fresh boundary.
+      bits = align_to(bits, m->ty->size * 8);
+    } else if (m->is_bitfield) {
+      // Keep packing into the unit already open if the field fits whole.
+      // Straddling a boundary is allowed by the ABI but never required, and
+      // gcc does not do it either, so a field that would straddle starts a
+      // new unit instead.
+      int unit = m->ty->size * 8;
+      if (bits % unit + m->bit_width > unit)
+        bits = align_to(bits, unit);
+      m->offset = (bits / unit) * m->ty->size;
+      m->bit_offset = bits % unit;
+      bits += m->bit_width;
     } else {
-      offset = align_to(offset, m->ty->align);
+      // An ordinary member closes whatever unit was open.
+      offset = align_to((bits + 7) / 8, m->ty->align);
       m->offset = offset;
       offset += m->ty->size;
+      bits = offset * 8;
     }
     if (ty->align < m->ty->align) ty->align = m->ty->align;
   }
-  if (!is_union) ty->size = offset;
+  if (!is_union) ty->size = (bits + 7) / 8;
   ty->size = align_to(ty->size, ty->align);
 
   if (tag) {
@@ -1511,7 +1586,8 @@ static Node *cast_expr(void);
 // abstract-declarator, i.e. a type with no identifier attached.
 static Type *typename_(void) {
   Type *ty = declspec(NULL);
-  while (consume("*")) ty = pointer_to(ty);
+  skip_qualifiers();
+  while (consume("*")) { ty = pointer_to(ty); skip_qualifiers(); }
   while (peek("[")) ty = type_suffix(ty);
   return ty;
 }
@@ -2002,7 +2078,8 @@ static void create_param_vars(Obj *params) {
 static Obj *function(Type *base, VarAttr *attr) {
   char *name;
   Type *ty = base;
-  while (consume("*")) ty = pointer_to(ty);
+  skip_qualifiers();
+  while (consume("*")) { ty = pointer_to(ty); skip_qualifiers(); }
   name = get_ident();
   expect("(");
 
@@ -2029,7 +2106,8 @@ static Obj *function(Type *base, VarAttr *attr) {
     // matters at a call; the name only matters to a body.
     char *pname = NULL;
     Type *pty = pbase;
-    while (consume("*")) pty = pointer_to(pty);
+    skip_qualifiers();
+    while (consume("*")) { pty = pointer_to(pty); skip_qualifiers(); }
     if (tk->kind == TK_IDENT) pname = get_ident();
     pty = type_suffix(pty);
     if (pty->kind == TY_ARRAY) pty = pointer_to(pty->base);   // arrays decay
@@ -3462,6 +3540,17 @@ static void gen_expr(Node *n) {
     // falls through to the binary-operator path and dereferences a NULL rhs.
     gen_addr(n);
     load(n->ty);
+    if (n->member->is_bitfield) {
+      // The load brought in the whole storage unit. Put the field in the top
+      // of the register and arithmetic-shift it back down: that is what
+      // sign-extends a signed field of an unusual width, and it costs the
+      // same as masking would.
+      Member *m = n->member;
+      int total = m->ty->size * 8;
+      emit("shl $%d, %%rax", 64 - m->bit_width - m->bit_offset);
+      emit(m->ty->is_unsigned ? "shr $%d, %%rax" : "sar $%d, %%rax", 64 - m->bit_width);
+      (void)total;
+    }
     return;
   case ND_CAST:
     gen_expr(n->lhs);
@@ -3471,6 +3560,49 @@ static void gen_expr(Node *n) {
     gen_addr(n->lhs);
     push();
     gen_expr(n->rhs);
+    if (n->lhs->kind == ND_MEMBER && n->lhs->member->is_bitfield) {
+      // Read, modify, write. A bitfield shares its storage unit with its
+      // neighbours, so a plain store would overwrite them; and the value of
+      // the assignment is the field as it reads back, truncated to its
+      // width, not the value that was offered.
+      Member *m = n->lhs->member;
+      // Unsigned, because the mask is shifted below and shifting a negative
+      // value left is undefined. This compiler's own sanitizer build is what
+      // said so, on the first 64-bit-wide field anyone wrote.
+      unsigned long mask =
+          m->bit_width == 64 ? ~0UL : ((1UL << m->bit_width) - 1);
+
+      emit("mov %%rax, %%r8");                     // keep the assigned value
+      pop("%rdi");                                 // rdi = address of the unit
+      // Through a register, not an immediate: AND takes at most a 32-bit
+      // immediate, and a 32-bit-wide field's mask does not fit in one. GAS
+      // quietly promotes "mov $imm64" to movabs and has no such escape for
+      // "and", so the only sign of the problem is the assembler refusing it.
+      emit("mov $%ld, %%r9", (long)mask);
+      emit("and %%r9, %%rax");                     // the bits that belong to us
+      emit("shl $%d, %%rax", m->bit_offset);       // moved into place
+
+      // Load the unit, clear our window, OR the new bits in.
+      if (m->ty->size == 1)      emit("movzbl (%%rdi), %%ecx");
+      else if (m->ty->size == 2) emit("movzwl (%%rdi), %%ecx");
+      else if (m->ty->size == 4) emit("movl (%%rdi), %%ecx");
+      else                       emit("mov (%%rdi), %%rcx");
+      emit("mov $%ld, %%r9", (long)~(mask << m->bit_offset));
+      emit("and %%r9, %%rcx");
+      emit("or %%rcx, %%rax");
+
+      if (m->ty->size == 1)      emit("mov %%al, (%%rdi)");
+      else if (m->ty->size == 2) emit("mov %%ax, (%%rdi)");
+      else if (m->ty->size == 4) emit("mov %%eax, (%%rdi)");
+      else                       emit("mov %%rax, (%%rdi)");
+
+      // The result of the assignment is what the field now holds, which for
+      // a signed field that overflowed its width is not what was assigned.
+      emit("mov %%r8, %%rax");
+      emit("shl $%d, %%rax", 64 - m->bit_width);
+      emit(m->ty->is_unsigned ? "shr $%d, %%rax" : "sar $%d, %%rax", 64 - m->bit_width);
+      return;
+    }
     store(n->ty);
     return;
   case ND_COMMA:
