@@ -346,15 +346,24 @@ which was a confident explanation of something that does not happen.
 
 ## Real headers
 
-`<stddef.h>`, `<stdarg.h>`, `<string.h>` and `<ctype.h>` are compiled from
-`/usr/include` and the resulting programs run. Three things stop the rest:
+`<stddef.h>`, `<stdarg.h>`, `<string.h>`, `<ctype.h>`, `<stdint.h>`,
+`<limits.h>` and `<stdbool.h>` are compiled from `/usr/include` and the
+resulting programs run. Two things stop the rest:
 
 | header | stops at |
 |---|---|
 | `<stdio.h>` | a function typedef |
 | `<stdlib.h>` | `typedef float _Float32` |
-| `<stdint.h>` | `__INT_LEAST8_TYPE__`, a gcc-internal builtin macro |
-| `<limits.h>` | `#include_next` |
+
+`<limits.h>` needed `#include_next`, which exists so that gcc's own
+`limits.h` can reach glibc's: two files of the same name in different
+directories, each deliberately pulling in the other. Searching from the
+start of the path list finds the same file again and recurses, so a file
+records which search path found it and the next search resumes after that.
+
+`<stdint.h>` needed the `__INT_LEAST8_TYPE__` family. gcc's own header asks
+the compiler what its integer types are called rather than hardcoding them,
+so a compiler that answers nothing gets nowhere.
 
 Not defining `__GNUC__` turns out to help rather than hurt: glibc hands a
 compiler that does not claim to be gcc the portable declarations, with no

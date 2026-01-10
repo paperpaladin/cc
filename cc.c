@@ -31,6 +31,7 @@ struct File {
   char *text;
   size_t len;
   File *next;
+  int path_index;   // which include path found it, for #include_next
 };
 static File *files;   // every file read so far, newest first
 
@@ -73,6 +74,7 @@ static File *new_file(char *name, char *text) {
   splice_lines(text);
   f->text = text;
   f->len  = strlen(text);
+  f->path_index = -1;
   f->next = files;
   files = f;
   return f;
@@ -2966,7 +2968,12 @@ static bool file_exists(char *path) {
   return true;
 }
 
+// Which include path the result came from, so #include_next can resume after
+// it. -1 means "not from the search path at all".
+static int found_in_path;
+
 static char *search_include(char *name, bool is_angle, Token *tok) {
+  found_in_path = -1;
   if (name[0] == '/') return file_exists(name) ? name : NULL;
 
   // A quoted include looks next to the including file first. Using the
@@ -2981,7 +2988,20 @@ static char *search_include(char *name, bool is_angle, Token *tok) {
   }
   for (int i = 0; i < n_include_paths; i++) {
     char *p = join_path(include_paths[i], name);
-    if (file_exists(p)) return p;
+    if (file_exists(p)) { found_in_path = i; return p; }
+  }
+  return NULL;
+}
+
+// #include_next finds the NEXT header of this name after the one currently
+// being read. It is how gcc's own limits.h reaches glibc's: two files with
+// the same name in different directories, each deliberately pulling in the
+// other. Searching from the start would find this file again and recurse.
+static char *search_include_next(char *name, Token *tok) {
+  int start = (tok->file ? tok->file->path_index : -1) + 1;
+  for (int i = start; i < n_include_paths; i++) {
+    char *p = join_path(include_paths[i], name);
+    if (file_exists(p)) { found_in_path = i; return p; }
   }
   return NULL;
 }
@@ -3079,6 +3099,46 @@ static void init_macros(void) {
   define_text("va_end(ap) ((void)0)");
   define_text("va_copy(d, s) ((void)((d)[0] = (s)[0]))");
 
+  // gcc's own stdint-gcc.h asks the compiler what its integer types are
+  // called, rather than hardcoding them, so these have to exist before
+  // <stdint.h> means anything. The values are the LP64 answers.
+  define_text("__CHAR_BIT__ 8");
+  define_text("__SIZEOF_INT__ 4");
+  define_text("__SIZEOF_LONG__ 8");
+  define_text("__SIZEOF_POINTER__ 8");
+  define_text("__SIZEOF_SHORT__ 2");
+  define_text("__SIZE_TYPE__ unsigned long");
+  define_text("__PTRDIFF_TYPE__ long");
+  define_text("__WCHAR_TYPE__ int");
+  define_text("__INTPTR_TYPE__ long");
+  define_text("__UINTPTR_TYPE__ unsigned long");
+  define_text("__INT8_TYPE__ signed char");
+  define_text("__INT16_TYPE__ short");
+  define_text("__INT32_TYPE__ int");
+  define_text("__INT64_TYPE__ long");
+  define_text("__UINT8_TYPE__ unsigned char");
+  define_text("__UINT16_TYPE__ unsigned short");
+  define_text("__UINT32_TYPE__ unsigned int");
+  define_text("__UINT64_TYPE__ unsigned long");
+  define_text("__INT_LEAST8_TYPE__ signed char");
+  define_text("__INT_LEAST16_TYPE__ short");
+  define_text("__INT_LEAST32_TYPE__ int");
+  define_text("__INT_LEAST64_TYPE__ long");
+  define_text("__UINT_LEAST8_TYPE__ unsigned char");
+  define_text("__UINT_LEAST16_TYPE__ unsigned short");
+  define_text("__UINT_LEAST32_TYPE__ unsigned int");
+  define_text("__UINT_LEAST64_TYPE__ unsigned long");
+  define_text("__INT_FAST8_TYPE__ signed char");
+  define_text("__INT_FAST16_TYPE__ long");
+  define_text("__INT_FAST32_TYPE__ long");
+  define_text("__INT_FAST64_TYPE__ long");
+  define_text("__UINT_FAST8_TYPE__ unsigned char");
+  define_text("__UINT_FAST16_TYPE__ unsigned long");
+  define_text("__UINT_FAST32_TYPE__ unsigned long");
+  define_text("__UINT_FAST64_TYPE__ unsigned long");
+  define_text("__INTMAX_TYPE__ long");
+  define_text("__UINTMAX_TYPE__ unsigned long");
+
   define_text("__STDC__ 1");
   define_text("__x86_64__ 1");
   define_text("__linux__ 1");
@@ -3156,12 +3216,16 @@ static Token *preprocess2(Token *tok) {
 
     if (tok->at_bol || tok->kind == TK_EOF) continue;   // a bare '#' is a null directive
 
-    if (tok_is(tok, "include")) {
+    if (tok_is(tok, "include") || tok_is(tok, "include_next")) {
+      bool next = tok_is(tok, "include_next");
       bool is_angle;
       char *name = read_include_filename(&tok, tok->next, &is_angle);
-      char *path = search_include(name, is_angle, start);
+      char *path = next ? search_include_next(name, start)
+                        : search_include(name, is_angle, start);
       if (!path) error_at(start->loc, "cannot find include file '%s'", name);
-      Token *inc = tokenize(new_file(path, read_file(path)));
+      File *f = new_file(path, read_file(path));
+      f->path_index = found_in_path;
+      Token *inc = tokenize(f);
       tok = append(inc, tok);
       continue;
     }

@@ -280,6 +280,11 @@ size_t n;
 ptrdiff_t d;'
 real_header 'include <stdarg.h>' '#include <stdarg.h>
 int x;'
+real_header 'include <string.h>'  '#include <string.h>'
+real_header 'include <stdint.h>'  '#include <stdint.h>
+int64_t v;'
+real_header 'include <limits.h>, via include_next' '#include <limits.h>
+int n = CHAR_BIT;'
 
 # Line splicing is phase 2 and happens before anything is a token, which is
 # why it can cut an identifier in half and still work.
