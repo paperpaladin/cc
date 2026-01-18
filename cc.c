@@ -362,6 +362,12 @@ static void convert_keywords(Token *t) {
 typedef enum {
   TY_VOID, TY_BOOL, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_ENUM,
   TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_FUNC,
+  // Declarable, not operable. A real header declares floating point long
+  // before anything calls it -- glibc reaches "typedef float _Float32" on
+  // the way to printf -- so refusing the TYPE blocks headers that have
+  // nothing to do with arithmetic. These parse, size correctly and take
+  // part in declarations; producing a value of one is a named error.
+  TY_FLOAT, TY_DOUBLE,
 } TypeKind;
 
 typedef struct Member Member;
@@ -406,6 +412,15 @@ static Type *ty_int    = PRIM(TY_INT,   4, false);
 static Type *ty_uint   = PRIM(TY_INT,   4, true);
 static Type *ty_long   = PRIM(TY_LONG,  8, false);
 static Type *ty_ulong  = PRIM(TY_LONG,  8, true);
+static Type *ty_float  = PRIM(TY_FLOAT,  4, false);
+static Type *ty_double = PRIM(TY_DOUBLE, 8, false);
+// x87 long double is 80 bits of value in 16 bytes of storage. Nothing here
+// can do arithmetic on one, but sizeof and struct layout are not arithmetic,
+// and a wrong size is a wrong answer rather than a missing feature. PLAN.md
+// used to propose aliasing this to double and documenting the lie; the
+// differential suite objected the moment the type became declarable, which
+// is a better argument than the one in the plan.
+static Type *ty_ldouble = PRIM(TY_DOUBLE, 16, false);
 #undef PRIM
 
 static Type *pointer_to(Type *base) {
@@ -804,6 +819,7 @@ static long const_expr(void);
 static char *TYPE_KEYWORDS[] = {
   "int", "char", "long", "short", "void", "unsigned", "signed", "_Bool",
   "struct", "union", "enum", "typedef", "static", "extern",
+  "float", "double",
   "const", "volatile", "restrict", "__restrict", "__restrict__",
   "inline", "__inline", "__inline__", "_Noreturn",
   NULL,
@@ -857,6 +873,8 @@ static Type *declspec(VarAttr *attr) {
     M_SHORT    = 1 << 6,
     M_INT      = 1 << 8,
     M_LONG     = 1 << 10,
+    M_FLOAT    = 1 << 16,
+    M_DOUBLE   = 1 << 18,
     M_OTHER    = 1 << 12,
     M_SIGNED   = 1 << 13,
     M_UNSIGNED = 1 << 14,
@@ -902,6 +920,8 @@ static Type *declspec(VarAttr *attr) {
     else if (consume("short"))    counter += M_SHORT;
     else if (consume("int"))      counter += M_INT;
     else if (consume("long"))     counter += M_LONG;
+    else if (consume("float"))    counter += M_FLOAT;
+    else if (consume("double"))   counter += M_DOUBLE;
     else if (consume("signed"))   counter |= M_SIGNED;
     else if (consume("unsigned")) counter |= M_UNSIGNED;
     else break;
@@ -945,6 +965,12 @@ static Type *declspec(VarAttr *attr) {
     case M_UNSIGNED + M_LONG + M_LONG:
     case M_UNSIGNED + M_LONG + M_LONG + M_INT:
       ty = ty_ulong; break;
+    case M_FLOAT:
+      ty = ty_float; break;
+    case M_DOUBLE:
+      ty = ty_double; break;
+    case M_LONG + M_DOUBLE:
+      ty = ty_ldouble; break;
     default:
       error_at(tk->loc, "these type specifiers cannot be combined");
     }
@@ -1023,6 +1049,24 @@ static long eval(Node *n) {
 static long const_expr(void) { return eval(conditional()); }
 
 static Type *type_suffix(Type *ty) {
+  // A function type, as in "typedef int handler_t(void *, long);". Only the
+  // return type is kept: nothing here calls through such a typedef, it is
+  // used to declare pointers, and a pointer to a function is eight bytes
+  // whatever the parameters are. Recording them would be work with no
+  // reader. The declaration still has to be *consumed*, though, or the
+  // parser resumes in the middle of a parameter list.
+  if (consume("(")) {
+    int depth = 0;
+    while (!(depth == 0 && peek(")"))) {
+      if (tk->kind == TK_EOF) error_at(tk->loc, "unterminated parameter list");
+      if (tok_is(tk, "(")) depth++;
+      else if (tok_is(tk, ")")) depth--;
+      tk = tk->next;
+    }
+    expect(")");
+    return func_returning(ty);
+  }
+
   if (consume("[")) {
     // An omitted dimension means "infer it from the initialiser"; it is recorded
     // as -1 and patched in declaration() once the initialiser has been counted.
@@ -2118,14 +2162,6 @@ static Obj *function(Type *base, VarAttr *attr) {
     pcur = pcur->next = p;
   }
 
-  for (Obj *p = phead.next; p; p = p->next)
-    if (is_aggregate(p->ty))
-      error_at(tk->loc, "passing a struct or union by value is not supported yet "
-                        "(needs SysV eightbyte classification; see PLAN.md)");
-  if (is_aggregate(ty))
-    error_at(tk->loc, "returning a struct or union by value is not supported yet "
-                      "(needs SysV eightbyte classification; see PLAN.md)");
-
   // A prototype followed by a definition is one function, not two. Creating a
   // second Obj would put a second symbol in the output and leave the call
   // sites bound to whichever happened to be found first.
@@ -2166,6 +2202,22 @@ static Obj *function(Type *base, VarAttr *attr) {
     fn->is_definition = false;
     return fn;
   }
+
+  // The struct-by-value refusal belongs here rather than at the declaration.
+  // A prototype for a function taking a struct is harmless as long as nobody
+  // calls it, and refusing it early costs real headers: glibc declares
+  // fopencookie(void *, const char *, cookie_io_functions_t), and nothing
+  // that merely includes <stdio.h> is asking to call it. A definition is
+  // different, because this is where the argument would have to be received.
+  for (Obj *pp = fn->params; pp; pp = pp->next)
+    if (is_aggregate(pp->ty))
+      error_at(tk->loc, "defining a function that takes a struct or union by value "
+                        "is not supported yet (needs SysV eightbyte "
+                        "classification; see PLAN.md)");
+  if (is_aggregate(ty))
+    error_at(tk->loc, "defining a function that returns a struct or union by value "
+                      "is not supported yet (needs SysV eightbyte "
+                      "classification; see PLAN.md)");
 
   expect("{");
   fn->is_definition = true;
@@ -3489,6 +3541,14 @@ static void load(Type *ty) {
   // An array or an aggregate has no loadable value: the address *is* the value.
   if (is_address_valued(ty)) return;
 
+  // The line between declarable and operable. A float may be named in a
+  // declaration all day; the moment one has to be read into a register
+  // there is no register class for it here, and inventing one silently
+  // would miscompile rather than refuse.
+  if (ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE)
+    error("floating point is not implemented: a float or double can be "
+          "declared, which is what real headers need, but not used");
+
   // Narrow loads must widen with the right sign, or a char holding 0xFF reads
   // as 255 where it should read as -1 (or the reverse for unsigned char).
   if (ty->size == 1)      emit(ty->is_unsigned ? "movzbl (%%rax), %%eax" : "movsbl (%%rax), %%eax");
@@ -3500,6 +3560,10 @@ static void load(Type *ty) {
 // Stack holds the destination address; rax holds the value.
 static void store(Type *ty) {
   pop("%rdi");
+
+  if (ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE)
+    error("floating point is not implemented: a float or double can be "
+          "declared, which is what real headers need, but not used");
 
   if (is_aggregate(ty)) {
     // rax holds the source address, rdi the destination. Copy byte by byte.

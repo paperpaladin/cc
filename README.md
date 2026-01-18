@@ -109,9 +109,13 @@ A stray backslash outside a string literal is rejected rather than carried
 along as a preprocessing token, which is legal C that real preprocessors
 accept; nothing here needs it, and the tokenizer is simpler without it.
 
-No `float` or `double`. No `va_arg` of a struct. `const`, `volatile` and
-`restrict` parse and are then ignored -- there is no const-checking here,
-and saying so is better than implying there is.
+**No floating-point arithmetic.** `float`, `double` and `long double` are
+declarable -- they parse, size correctly at 4, 8 and 16, and appear in
+declarations, which is what real headers need -- but producing a value of
+one is an error rather than a silent miscompilation. No `va_arg` of a
+struct. `const`, `volatile` and `restrict` parse and are then ignored;
+there is no const-checking here, and saying so is better than implying
+there is.
 A call may pass at most six arguments (a definition may *receive* more than
 six through `va_arg`, which is how the overflow path gets tested at all). No variadic function
 *definitions* (calling a variadic function works). Passing or returning a struct
@@ -346,14 +350,14 @@ which was a confident explanation of something that does not happen.
 
 ## Real headers
 
-`<stddef.h>`, `<stdarg.h>`, `<string.h>`, `<ctype.h>`, `<stdint.h>`,
-`<limits.h>` and `<stdbool.h>` are compiled from `/usr/include` and the
-resulting programs run. Two things stop the rest:
+`<stdio.h>`, `<string.h>`, `<ctype.h>`, `<stdint.h>`, `<limits.h>`,
+`<stdbool.h>`, `<stddef.h>` and `<stdarg.h>` are compiled from
+`/usr/include`, and a program calling `printf`, `sprintf` and `strcmp`
+through them runs. One header is left:
 
 | header | stops at |
 |---|---|
-| `<stdio.h>` | a function typedef |
-| `<stdlib.h>` | `typedef float _Float32` |
+| `<stdlib.h>` | `void (*__func)(void)`, a function pointer declarator |
 
 `<limits.h>` needed `#include_next`, which exists so that gcc's own
 `limits.h` can reach glibc's: two files of the same name in different

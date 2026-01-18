@@ -322,6 +322,30 @@ initialisers, and variadic definitions for the error helpers.
             "typedef float _Float32", which is the first time the no-float
             decision has actually cost anything.
 
+- [x] 12d real headers, and floating point as a declarable type
+      why: <stdio.h> and <stdlib.h> both stopped at "typedef float _Float32",
+           and refusing the TYPE blocks headers that never do arithmetic.
+      done: float, double and long double parse, size correctly (4, 8, 16)
+            and take part in declarations. Producing a VALUE of one is a
+            named error in load() and store(), which is the only place a
+            floating-point register would be needed. Declarable, not
+            operable, and the suite asserts both halves.
+            Function typedefs ("typedef int handler(void *)") parse; only
+            the return type is kept, since nothing calls through one.
+            The struct-by-value refusal moved from the declaration to the
+            definition and the call. glibc declares fopencookie taking a
+            cookie_io_functions_t by value, and nothing that merely includes
+            <stdio.h> is asking to call it.
+      state: <stdio.h> compiles, and a program using printf, sprintf and
+            strcmp through real glibc headers runs. <stdlib.h> is the last
+            one and stops at "void (*__func)(void)" -- function pointer
+            declarators, which need recursive declarator parsing.
+      found: t/run.sh gained unimpl(), the opposite of refuse(): gcc must
+            ACCEPT the program and we must reject it cleanly. The failure
+            mode of an unimplemented feature is not a missing error, it is
+            silently generating wrong code for something that looked close
+            enough, and four documented gaps now assert they refuse instead.
+
 ### Milestone 2 -- external conformance
 
 - [ ] 16 `c-testsuite` runner, publishing the pass rate with the failures named
@@ -339,9 +363,13 @@ initialisers, and variadic definitions for the error helpers.
 
 ## Open questions
 
-- `long double`: planning to alias it to `double` and document the lie rather
-  than implement x87 80-bit. That is a deliberate known-wrong answer, which is
-  different from an unimplemented one, so it has to be stated in the README.
+- ~~`long double`: planning to alias it to `double` and document the lie.~~
+  Resolved, and not the way this said. `long double` is declarable with its
+  real 16-byte size and refuses to be operated on, so there is no lie left to
+  document. The differential suite is what settled it: the moment the type
+  became declarable, `sizeof(long double)` was a `check` asserting 8 against
+  gcc and clang both saying 16, and a deliberate known-wrong answer turns out
+  to be very hard to keep once something outside the repo gets a vote on it.
 - Struct assignment currently emits an unrolled byte copy, so a 4KB struct would
   produce 8K instructions. Fine today; needs `rep movsb` or a loop before
   anything real is compiled.
