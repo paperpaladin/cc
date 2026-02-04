@@ -463,7 +463,12 @@ static bool is_aggregate(Type *t) { return t->kind == TY_STRUCT || t->kind == TY
 // An aggregate and an array both evaluate to their own address rather than to a
 // loadable value, which is the single rule that makes member access, array
 // indexing and struct copying all fall out of the same codegen.
-static bool is_address_valued(Type *t) { return t->kind == TY_ARRAY || is_aggregate(t); }
+// A function joins arrays and aggregates here: its "value" is its address.
+// Without it, loading a function designator emits mov (%rax), %rax and
+// dereferences the first instruction of the code.
+static bool is_address_valued(Type *t) {
+  return t->kind == TY_ARRAY || t->kind == TY_FUNC || is_aggregate(t);
+}
 
 // ------------------------------------------------------------------------ AST
 
@@ -534,9 +539,10 @@ struct Node {
   Node *body;      // ND_BLOCK
 
   // ND_FUNCALL
-  char *funcname;
+  char *funcname;  // direct call: the symbol to call
   Node *args;
   Obj *fn;         // the declaration, when there is one
+  Node *callee;    // indirect call: the expression yielding the address
 
   Member *member;  // ND_MEMBER
 
@@ -645,6 +651,7 @@ static void add_type(Node *n) {
     // that case and the README says so.
     // shortcut: implicit declarations assume long. Make them an error once
     // cc.c itself declares everything it calls.
+    if (n->callee) return;          // set when the call node was built
     n->ty = n->fn ? n->fn->ty->ret : ty_long;
     return;
   default:
@@ -1079,10 +1086,51 @@ static Type *type_suffix(Type *ty) {
   return ty;
 }
 
+// Move the cursor past a balanced "( ... )" that starts at the cursor.
+static void skip_parens(void) {
+  int depth = 0;
+  do {
+    if (tk->kind == TK_EOF) error_at(tk->loc, "unbalanced parentheses in a declarator");
+    if (tok_is(tk, "(")) depth++;
+    else if (tok_is(tk, ")")) depth--;
+    tk = tk->next;
+  } while (depth);
+}
+
+// declarator = "*"* ( ident | "(" declarator ")" ) type-suffix*
+//
+// The parenthesised form is what makes "int (*fp)(int)" a pointer to a
+// function rather than a function returning a pointer, and it cannot be
+// parsed in one pass: the suffix AFTER the closing paren -- here "(int)" --
+// describes what the thing inside the parens points AT, so it has to be read
+// before the inside means anything.
+//
+// So the parens are skipped, the outer suffix is parsed to build the type
+// the inner declarator should be handed, and then the cursor goes back and
+// reads the inside against it. Two passes over a handful of tokens, and the
+// alternative is threading a half-built type through the recursion.
+//
+// *name comes back NULL for an abstract declarator, which is legal in a
+// parameter list: "void (*)(void)" names nothing.
 static Type *declarator(Type *ty, char **name) {
+  *name = NULL;
   skip_qualifiers();
   while (consume("*")) { ty = pointer_to(ty); skip_qualifiers(); }
-  *name = get_ident();
+
+  if (peek("(")) {
+    Token *inner = tk->next;
+    skip_parens();                 // cursor now sits on the outer suffix
+    ty = type_suffix(ty);          // which is what the inside points at
+    Token *after = tk;
+
+    tk = inner;
+    Type *res = declarator(ty, name);
+    if (!peek(")")) error_at(tk->loc, "expected ')' to close a declarator");
+    tk = after;
+    return res;
+  }
+
+  if (tk->kind == TK_IDENT) *name = get_ident();
   return type_suffix(ty);
 }
 
@@ -1577,6 +1625,28 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   return NULL;
 }
 
+// A call through a pointer. The parameter types are unknown here -- the
+// pointer's type records only that it points at a function -- so arguments
+// are passed as written, which is what C says happens when no prototype is
+// in scope at the call.
+static Node *indirect_call(Node *callee, Token *tok) {
+  expect("(");
+  Node head = {0};
+  Node *cur = &head;
+  while (!consume(")")) {
+    if (cur != &head) expect(",");
+    cur = cur->next = assign();
+    add_type(cur);
+  }
+  Node *n = new_node(ND_FUNCALL, tok);
+  n->callee = callee;
+  n->args = head.next;
+  // The call's type is the pointed-at function's return type.
+  Type *ft = callee->ty->kind == TY_PTR ? callee->ty->base : callee->ty;
+  n->ty = ft->ret ? ft->ret : ty_long;
+  return n;
+}
+
 static Node *funcall(char *name, Token *tok) {
   // The declaration, if this call has one. Looked up before the arguments are
   // parsed so each one can be converted to its parameter's type on the way in.
@@ -1714,7 +1784,18 @@ static Node *primary(void) {
     }
 
     char *name = get_ident();
-    if (consume("(")) return funcall(name, tok);
+    // Only a name that is not a variable becomes a direct call. If it names
+    // a function pointer, the value has to be loaded and postfix() makes the
+    // call -- otherwise "fp(3)" assembles into "call fp", a direct jump to
+    // the address of the pointer rather than through it, and the linker
+    // happily resolves the symbol.
+    if (peek("(")) {
+      VarScope *v = find_name(tok);
+      if (!v || !v->var || v->var->is_function) {
+        tk = tk->next;                  // funcall starts after the '('
+        return funcall(name, tok);
+      }
+    }
 
     VarScope *vs = find_name(tok);
     if (!vs) error_at(tok->loc, "undefined identifier '%s'", name);
@@ -1728,11 +1809,24 @@ static Node *primary(void) {
   return NULL;
 }
 
-// postfix = primary ("[" expr "]" | "++" | "--")*
+static Node *indirect_call(Node *callee, Token *tok);
+
+// postfix = primary ("(" args ")" | "[" expr "]" | "." ident | "->" ident | "++" | "--")*
 static Node *postfix(void) {
   Node *n = primary();
   for (;;) {
     Token *tok = tk;
+    // A call is an operator on an expression, not a thing only a name can
+    // do. Keeping it in primary() meant "m->builtin(tok)" could not be
+    // written, and that is the shape cc.c uses for its own builtin macros.
+    if (peek("(")) {
+      add_type(n);
+      if (n->ty && (n->ty->kind == TY_FUNC ||
+                    (n->ty->kind == TY_PTR && n->ty->base->kind == TY_FUNC))) {
+        n = indirect_call(n, tok);
+        continue;
+      }
+    }
     if (consume("[")) {               // a[i] is *(a+i), exactly as C says
       Node *idx = expr();
       expect("]");
@@ -2151,12 +2245,9 @@ static Obj *function(Type *base, VarAttr *attr) {
     // "int f(int);" is the form almost every header uses. The type is what
     // matters at a call; the name only matters to a body.
     char *pname = NULL;
-    Type *pty = pbase;
-    skip_qualifiers();
-    while (consume("*")) { pty = pointer_to(pty); skip_qualifiers(); }
-    if (tk->kind == TK_IDENT) pname = get_ident();
-    pty = type_suffix(pty);
+    Type *pty = declarator(pbase, &pname);
     if (pty->kind == TY_ARRAY) pty = pointer_to(pty->base);   // arrays decay
+    if (pty->kind == TY_FUNC) pty = pointer_to(pty);          // so do functions
     Obj *p = calloc(1, sizeof(Obj));
     p->name = pname; p->ty = pty;
     pcur = pcur->next = p;
@@ -3836,18 +3927,28 @@ static void gen_expr(Node *n) {
       nargs++;
     }
     if (nargs > 6) error_at(n->tok->loc, "more than 6 arguments is not supported");
+
+    // The callee address is computed before the argument registers are
+    // loaded, and parked on the stack: evaluating it could call something
+    // else, and anything it calls would clobber them.
+    if (n->callee) {
+      gen_expr(n->callee);
+      push();
+    }
+    // The callee was pushed after the arguments, so it is on top and has to
+    // come off first. Popping the arguments first puts the callee in an
+    // argument register and the last argument in %r10, and the call jumps
+    // to whatever the argument happened to be.
+    if (n->callee) pop("%r10");
     for (int i = nargs - 1; i >= 0; i--) pop(ARGREG64[i]);
 
     // The ABI wants %rsp 16-byte aligned at the call. depth counts our pushes;
     // an odd count means we are 8 off.
     emit("mov $0, %%rax");        // no vector registers used, for varargs
-    if (depth % 2 == 0) {
-      emit("call %s", n->funcname);
-    } else {
-      emit("sub $8, %%rsp");
-      emit("call %s", n->funcname);
-      emit("add $8, %%rsp");
-    }
+    if (depth % 2 != 0) emit("sub $8, %%rsp");
+    if (n->callee) emit("call *%%r10");
+    else           emit("call %s", n->funcname);
+    if (depth % 2 != 0) emit("add $8, %%rsp");
     return;
   }
   default:

@@ -63,6 +63,12 @@ uninitialised stack.
 **Calls** -- definitions and calls up to 6 arguments, recursion, and calls into
 libc that get the ABI right.
 
+**Function pointers** -- declaring, assigning, passing, returning through,
+arrays of them, and calling through one from a struct member. Needed
+recursive declarator parsing, because `int (*fp)(int)` cannot be read in one
+pass: the suffix after the closing paren describes what the thing inside the
+parens points *at*.
+
 **Bitfields** -- packing, `:0` to break a storage unit, unnamed padding
 fields, signed and unsigned, up to the full width of the underlying type.
 Layout matches gcc on every case in the suite. A field that will not fit
@@ -351,13 +357,9 @@ which was a confident explanation of something that does not happen.
 ## Real headers
 
 `<stdio.h>`, `<string.h>`, `<ctype.h>`, `<stdint.h>`, `<limits.h>`,
-`<stdbool.h>`, `<stddef.h>` and `<stdarg.h>` are compiled from
+`<stdbool.h>`, `<stddef.h>`, `<stdarg.h>` and `<stdlib.h>` are compiled from
 `/usr/include`, and a program calling `printf`, `sprintf` and `strcmp`
-through them runs. One header is left:
-
-| header | stops at |
-|---|---|
-| `<stdlib.h>` | `void (*__func)(void)`, a function pointer declarator |
+through them runs. That is every header this compiler has been pointed at.
 
 `<limits.h>` needed `#include_next`, which exists so that gcc's own
 `limits.h` can reach glibc's: two files of the same name in different
