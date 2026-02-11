@@ -153,6 +153,8 @@ struct Token {
   // these are set by the tokenizer and consumed before parsing begins.
   File *file;
   int line;
+  bool num_long;      // TK_NUM: an L suffix, or too large for an int
+  bool num_unsigned;  // TK_NUM: a U suffix
   bool at_bol;     // first token on its line: only here can a '#' be a directive
   bool has_space;  // whitespace preceded it, which '#' stringification must preserve
   HideSet *hide;   // macros this token may not be re-expanded by
@@ -292,9 +294,18 @@ static Token *tokenize(File *file) {
       // strtol saturates at LONG_MAX, so 18446744073709551615 silently
       // became 9223372036854775807 rather than the bit pattern it names.
       long v = (long)strtoul(p, &p, 0);
-      while (*p == 'u' || *p == 'U' || *p == 'l' || *p == 'L') p++;  // ignore suffixes
+      // The suffix is not noise. "1L << 32" is a 64-bit shift and "1 << 32"
+      // is not, so a literal that says it is long has to be believed, and a
+      // literal too large for an int is long whether it says so or not.
+      bool suf_u = false, suf_l = false;
+      while (*p == 'u' || *p == 'U' || *p == 'l' || *p == 'L') {
+        if (*p == 'u' || *p == 'U') suf_u = true; else suf_l = true;
+        p++;
+      }
       cur = cur->next = new_token(TK_NUM, start, p);
       cur->val = v;
+      cur->num_unsigned = suf_u;
+      cur->num_long = suf_l || v > 2147483647L || v < -2147483648L;
       continue;
     }
 
@@ -577,7 +588,16 @@ static Node *new_unary(NodeKind kind, Node *lhs, Token *tok) {
 static Node *new_num(long v, Token *tok) {
   Node *n = new_node(ND_NUM, tok); n->val = v; n->ty = ty_int; return n;
 }
+static void add_type(Node *n);
+
 static Node *new_cast(Node *expr, Type *ty) {
+  // The operand must be typed before it is wrapped, and the caller cannot be
+  // relied on to have done it: cast_expr() builds "(long)f()" out of a call
+  // node nobody has typed yet, and codegen then asks a NULL type what kind
+  // it is. Every other caller happened to pass something already typed,
+  // which is why casting a function call crashed the compiler and nothing
+  // noticed until it was pointed at its own source.
+  add_type(expr);
   Node *n = calloc(1, sizeof(Node));
   n->kind = ND_CAST;
   n->tok = expr->tok;
@@ -817,6 +837,7 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
 static Node *stmt(void);
 static Node *compound_stmt(void);
 static long eval(Node *n);
+static bool in_function_body;
 static Type *declspec(VarAttr *attr);
 static Type *declarator(Type *ty, char **name);
 static Type *struct_union_decl(void);
@@ -1470,11 +1491,28 @@ static void global_init(char *buf, Relocation **rel, Type *ty, int offset) {
 
   if (is_aggregate(ty)) {
     expect("{");
-    for (Member *m = ty->members; m; m = m->next) {
-      if (m != ty->members && !consume(",")) break;
+    Member *m = ty->members;
+    bool first = true;
+    while (!peek("}")) {
+      if (!first && !consume(",")) break;
       if (peek("}")) break;
+      first = false;
+
+      // A designator names the member to initialise, and the ones it skips
+      // keep the zero the buffer already holds. Members after a designator
+      // continue from it, which is what makes ".size = 4, .align = 4" work
+      // without naming every field in between.
+      if (consume(".")) {
+        if (tk->kind != TK_IDENT) error_at(tk->loc, "expected a member name after '.'");
+        m = get_member(ty, tk);
+        tk = tk->next;
+        expect("=");
+      }
+      if (!m) error_at(tk->loc, "too many initialisers for this struct");
+
       global_init(buf, rel, m->ty, offset + m->offset);
-      if (ty->kind == TY_UNION) break;   // only the first member is initialised
+      if (ty->kind == TY_UNION) break;   // only one member has storage
+      m = m->next;
     }
     consume(",");
     expect("}");
@@ -1588,7 +1626,12 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
   if (is_integer(lhs->ty) && is_pointer(rhs->ty)) { Node *t = lhs; lhs = rhs; rhs = t; }
 
   int sz = lhs->ty->base->size;
-  Node *scaled = new_binary(ND_MUL, rhs, new_num(sz, tok), tok);
+  // The index is widened to long BEFORE it is scaled. Both operands are
+  // otherwise int-sized, so the multiply is emitted as a 32-bit imul, whose
+  // result is zero-extended into the full register: index -1 becomes
+  // 0xFFFFFFFF and "p[-1]" reads four gigabytes forward instead of one byte
+  // back. An index is a pointer offset and belongs in 64 bits from the start.
+  Node *scaled = new_binary(ND_MUL, new_cast(rhs, ty_long), new_num(sz, tok), tok);
   add_type(scaled);
   Node *n = new_binary(ND_ADD, lhs, scaled, tok);
   // Decay: pointer arithmetic on an array yields a pointer to its element.
@@ -1604,7 +1647,7 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
 
   if (is_pointer(lhs->ty) && is_integer(rhs->ty)) {
     int sz = lhs->ty->base->size;
-    Node *scaled = new_binary(ND_MUL, rhs, new_num(sz, tok), tok);
+    Node *scaled = new_binary(ND_MUL, new_cast(rhs, ty_long), new_num(sz, tok), tok);
     add_type(scaled);
     Node *n = new_binary(ND_SUB, lhs, scaled, tok);
     n->ty = pointer_to(lhs->ty->base);
@@ -1739,6 +1782,10 @@ static Node *primary(void) {
 
   if (tk->kind == TK_NUM) {
     Node *n = new_num(tk->val, tk);
+    if (tk->num_long)
+      n->ty = tk->num_unsigned ? ty_ulong : ty_long;
+    else if (tk->num_unsigned)
+      n->ty = ty_uint;
     tk = tk->next;
     return n;
   }
@@ -1808,8 +1855,6 @@ static Node *primary(void) {
   error_at(tk->loc, "expected an expression");
   return NULL;
 }
-
-static Node *indirect_call(Node *callee, Token *tok);
 
 // postfix = primary ("(" args ")" | "[" expr "]" | "." ident | "->" ident | "++" | "--")*
 static Node *postfix(void) {
@@ -1898,6 +1943,33 @@ static Node *unary(void) {
 //
 // The "(" is ambiguous with a parenthesised expression, and only the scope stack
 // can resolve it: "(x)" is a cast if and only if x names a type here.
+// An unnamed object with an initialiser, living as long as the scope it
+// appears in. At file scope that is forever, so it becomes an anonymous
+// global with a byte pattern -- which is how
+//   #define PRIM(k, sz, uns) &(Type){.kind = (k), ...}
+// gives a static initialiser something to take the address of.
+//
+// Inside a function it would be an anonymous local with the initialiser
+// lowered to assignments; nothing here needs that yet, so it is refused by
+// name rather than quietly given static storage, which would make two calls
+// share one object.
+static int literal_id;
+// The flag is declared near the top: not `locals != NULL`, which is
+// whatever the last function or prototype left behind, so every file-scope
+// initialiser after the first prototype would look like it is inside one.
+static Node *compound_literal(Type *ty, Token *tok) {
+  if (in_function_body)
+    error_at(tok->loc, "a compound literal inside a function is not supported yet "
+                       "(it would need an anonymous local; see PLAN.md)");
+
+  char name[32];
+  snprintf(name, sizeof(name), ".L.lit.%d", literal_id++);
+  Obj *v = new_var(strdup(name), ty, false);
+  v->is_static = true;
+  read_static_init(v);
+  return new_var_node(v, tok);
+}
+
 static Node *cast_expr(void) {
   if (peek("(")) {
     Token *save = tk;
@@ -1905,6 +1977,10 @@ static Node *cast_expr(void) {
     if (is_typename()) {
       Type *ty = typename_();
       expect(")");
+      // "(Type){...}" is a compound literal, not a cast: the parenthesised
+      // type names an unnamed OBJECT rather than a conversion. The two are
+      // distinguished only by what follows the paren.
+      if (peek("{")) return compound_literal(ty, save);
       Node *n = new_cast(cast_expr(), ty);
       return n;
     }
@@ -2063,6 +2139,13 @@ static Node *stmt(void) {
   Token *tok = tk;
 
   if (consume("return")) {
+    // "return;" is how every void function ends early, and nothing in this
+    // suite had one until the compiler was pointed at its own source.
+    if (consume(";")) {
+      Node *n = new_node(ND_RETURN, tok);
+      n->ty = ty_void;
+      return n;
+    }
     Node *n = new_unary(ND_RETURN, expr(), tok);
     add_type(n);
     expect(";");
@@ -2290,7 +2373,11 @@ static Obj *function(Type *base, VarAttr *attr) {
 
   if (consume(";")) {           // prototype
     leave_scope();
-    fn->is_definition = false;
+    // Deliberately does NOT clear is_definition. A declaration says nothing
+    // about whether this translation unit defines the function, and since
+    // prototype and definition now share one Obj, clearing it here makes a
+    // declaration that appears AFTER a definition delete the definition.
+    // The symbol then vanishes from the output and only the linker notices.
     return fn;
   }
 
@@ -2313,7 +2400,9 @@ static Obj *function(Type *base, VarAttr *attr) {
   expect("{");
   fn->is_definition = true;
   gotos = labels = NULL;
+  in_function_body = true;
   fn->body = compound_stmt();
+  in_function_body = false;
   fn->locals = locals;
   leave_scope();
 
@@ -3240,6 +3329,9 @@ static void init_macros(void) {
   define_text("va_start(ap, last) __builtin_va_start(ap, last)");
   define_text("va_arg(ap, ty) __builtin_va_arg(ap, ty)");
   define_text("va_end(ap) ((void)0)");
+  // The real <stdarg.h> defines va_end in terms of this, and a
+  // translation unit that includes it gets that spelling instead.
+  define_text("__builtin_va_end(ap) ((void)0)");
   define_text("va_copy(d, s) ((void)((d)[0] = (s)[0]))");
 
   // gcc's own stdint-gcc.h asks the compiler what its integer types are
@@ -3963,7 +4055,14 @@ static void gen_expr(Node *n) {
 
   // Use 32-bit forms when both operands are narrow, so that int arithmetic
   // wraps at 32 bits the way C requires.
-  bool wide = (n->lhs->ty->size == 8 || n->rhs->ty->size == 8 || is_pointer(n->lhs->ty));
+  // A shift is not symmetric: the result is as wide as what is being
+  // shifted, and the count's own width says nothing. Including it made
+  // "1L << 32" a 32-bit shift whenever the count was an int, and x86 masks
+  // a 32-bit shift count to 5 bits, so the answer was 1 rather than 2^32.
+  bool shift = (n->kind == ND_SHL || n->kind == ND_SHR);
+  bool wide = shift
+      ? (n->lhs->ty->size == 8 || is_pointer(n->lhs->ty))
+      : (n->lhs->ty->size == 8 || n->rhs->ty->size == 8 || is_pointer(n->lhs->ty));
   char *ax = wide ? "%rax" : "%eax";
   char *di = wide ? "%rdi" : "%edi";
   // Signedness decides div vs idiv and setb vs setl.
@@ -4020,7 +4119,7 @@ static void gen_stmt(Node *n) {
     gen_expr(n->lhs);
     return;
   case ND_RETURN:
-    gen_expr(n->lhs);
+    if (n->lhs) gen_expr(n->lhs);   // "return;" has nothing to evaluate
     emit("jmp .L.return.%s", current_fn->name);
     return;
   case ND_IF: {

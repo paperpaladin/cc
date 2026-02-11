@@ -22,6 +22,32 @@ codegen bugs, and both were wrong expectations I had computed by hand
 (`-17 % 5` is `-2`, not `-3`). The differential harness would have caught them
 without the detour.
 
+## It compiles itself
+
+```
+$ make self-host
+ok   stage 1: cc compiles cc.c
+ok   stage 2: cc2 compiles cc.c
+ok   the fixpoint: cc2 and cc3 are byte-identical
+ok   cc2 passes t/run.sh  (302 passed, 0 failed)
+ok   cc2 passes t/cpp.sh  (64 passed, 0 failed)
+ok   cc2 builds an ordinary program through real headers
+```
+
+The fixpoint is the hard invariant this project was built around, and it is
+worth being precise about what it proves. It says the compiler is a *fixed
+point of itself*: whatever `cc2` does differently from `cc`, it does
+consistently enough to reproduce itself byte for byte. A miscompilation on
+any path `cc.c` exercises shows up as `cc3` differing from `cc2`.
+
+It does **not** prove `cc2` is correct, and this is not a theoretical
+caveat. At the first green `cmp cc2 cc3` here, `cc2` still failed 15 cases
+of `t/run.sh`. The fixpoint said *stable* and the suite said *wrong*, and
+the suite was right. A compiler that miscompiles itself self-consistently
+reaches a fixpoint perfectly happily. So `make self-host` runs the whole
+suite against the stage-2 compiler too, and that is the assertion with
+teeth.
+
 ## Status
 
 ```
@@ -129,11 +155,7 @@ six through `va_arg`, which is how the overflow path gets tested at all). No var
 miscompiled -- that needs the SysV eightbyte classification algorithm, which is
 its own milestone.
 
-It cannot compile itself yet. The preprocessor was the largest blocker and is
-now in; what remains is function prototypes, `static`/`extern`, global
-initialisers and the rest of milestone 1. The unsupported list is ordered by
-what `cc.c` itself uses, so that self-hosting arrives as early as possible --
-see `PLAN.md`.
+It compiles itself. See the top of this file.
 
 ## Design
 

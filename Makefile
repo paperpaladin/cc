@@ -7,6 +7,12 @@ test: cc
 	@./t/run.sh
 	@./t/cpp.sh
 
+# The fixpoint, and the proof that the stage-2 compiler is more than stable.
+# Not folded into `test`: it builds the compiler three times and runs the
+# whole suite twice, which is minutes rather than seconds.
+self-host: cc
+	@./t/selfhost.sh
+
 # The same suite, run against a sanitized compiler. A compiler reads
 # untrusted bytes for a living, and every test here already drives it over a
 # program; the only thing missing was something watching the memory while it
@@ -35,4 +41,4 @@ diff-test: cc
 clean:
 	rm -f cc cc-asan *.s *.cc.s a.out t/tmp*
 
-.PHONY: test test-asan diff-test clean
+.PHONY: test test-asan self-host diff-test clean

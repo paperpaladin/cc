@@ -9,17 +9,21 @@ C-shaped language.
 
 ## Hard invariant
 
-**The fixpoint.** Once `cc` can compile itself:
+**The fixpoint.** `cc` compiles itself:
 
 ```
 ./cc cc.c -o cc2 && ./cc2 cc.c -o cc3 && cmp cc2 cc3
 ```
 
-`cc2` and `cc3` must be byte-identical. Any miscompilation that touches a code
-path `cc` itself uses breaks this loudly. It is the cheapest regression test in
-the project and costs one `cmp`.
+`cc2` and `cc3` are byte-identical. Any miscompilation touching a code path
+`cc` itself uses breaks this loudly, and it costs one `cmp`.
 
-Not yet reachable -- see milestone 1.
+**Reached**, and the qualification matters more than the milestone. The
+fixpoint proves the compiler is STABLE, not correct: at the first green
+`cmp cc2 cc3`, cc2 still failed 15 cases of t/run.sh, because a compiler
+that miscompiles itself self-consistently reaches a fixpoint without
+complaint. The invariant is therefore the fixpoint AND the stage-2 compiler
+passing the whole suite, which is what `make self-host` asserts.
 
 ## Oracle
 
@@ -334,7 +338,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
             an earlier run of the suite had reported 291 passed against a
             binary that had not been rebuilt. Rebuild, then read.
       proves: 5 planted defects, 5 caught.
-- [ ] 14 compound literals with designated initialisers
+- [x] 14 compound literals with designated initialisers
       why: the other one. `#define PRIM(k, sz, uns) &(Type){.kind = (k), ...}`
            is how `cc.c` builds its ten primitive types, and it is C99 rather
            than GNU C, so there is no way around it short of rewriting the
@@ -354,7 +358,27 @@ initialisers. That is the whole remaining distance to the fixpoint.
 - [ ] 16 integer promotion done properly, rather than the current approximation
       note: the relational half of this turned out to be a real bug and was
             fixed early, as 08b. What is left is the arithmetic half.
-- [ ] 17 **self-host**: `cmp cc2 cc3` in CI
+- [x] 17 **self-host**: `cmp cc2 cc3` in CI -- `make self-host`
+      done: five bugs had to be fixed, and not one was found by looking.
+            Three came from the compiler failing on its own source:
+              new_cast() never typed its operand, so "(long)f()" handed
+              codegen a NULL type. Every other caller passed something
+              already typed, so casting a CALL crashed the compiler.
+              A prototype appearing AFTER a definition cleared
+              is_definition and deleted the definition from the output.
+              Only the linker noticed.
+              Pointer scaling multiplied in 32 bits, so a negative index
+              was zero-extended and p[-1] read four gigabytes forward.
+              verror_at() walks backwards that way to find the start of a
+              line, so every error message in the self-hosted compiler
+              segfaulted.
+            Two more came from cc2 failing cases cc passed:
+              every integer literal was typed int, so "1L" was an int;
+              and a shift took its width from BOTH operands, so "1L << 32"
+              was emitted as a 32-bit shift and x86 masked the count to 5
+              bits, giving 1.
+      proves: the fixpoint, plus cc2 passing all 302 + 64 cases and building
+            an ordinary program through real headers.
       proves: the fixpoint invariant, from here to the end of the project
 
 - [x] 12c #include_next, and the compiler's answers about its own types
