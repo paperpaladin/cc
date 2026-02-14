@@ -249,11 +249,11 @@ the published torture tests for rescanning, `#`, `##` and variadic macros.
 
 ```
 $ make test
-319 passed, 0 failed
+324 passed, 0 failed
 64 passed, 0 failed
 
 $ make test-asan        # the same suite, watched
-319 passed, 0 failed
+324 passed, 0 failed
 64 passed, 0 failed
 ```
 
@@ -307,6 +307,19 @@ int main(){ int i = -1; return f(i); }   // 1 only if the call sign-extends
 ```
 
 With that case in, the mutant dies.
+
+### Checking a type, not just a number
+
+The usual arithmetic conversions are verified by 368 generated expressions
+-- every operand type against every integer operator, plus a separate sweep
+for shifts, which are not symmetric and whose count has to stay in range.
+
+Each is compared with gcc on **three** things at once: the sign of the
+result, whether it is zero, and its `sizeof`. That last one is the point. A
+wrong type very often computes the right number, and this item existed
+because of exactly that case: `u - 1` on an unsigned `u` produced precisely
+the right bits and then described itself as an `int`, so the comparison
+after it went signed. A suite that only checks values cannot see it.
 
 ### The bug that found itself
 

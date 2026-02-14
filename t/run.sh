@@ -736,6 +736,90 @@ DRV
 }
 abi_test
 
+# --- the usual arithmetic conversions, exhaustively (PLAN 16)
+#
+# Every operand-type pair against every integer operator, 320 expressions,
+# each compared with gcc on three things at once: the sign of the result,
+# whether it is zero, and its sizeof. Checking only the value would miss a
+# wrong type that happens to compute the right number, which is exactly the
+# bug this item was about -- "u - 1" produced the correct bits and then
+# called itself an int, so the comparison after it went signed.
+#
+# Written as a loop rather than 320 lines because a hand-written matrix is
+# where an author quietly omits the combination they are unsure about.
+promotion_matrix() {
+  d=$T.promo
+  rm -rf "$d"; mkdir -p "$d"
+  _n=0; _bad=0
+  for A in 'char a=-3' 'short a=-3' 'int a=-3' 'long a=-3' \
+           'unsigned char a=3' 'unsigned short a=3' 'unsigned a=3' 'unsigned long a=3'; do
+    for B in 'char b=5' 'int b=-5' 'unsigned b=5' 'long b=-5' 'unsigned long b=5'; do
+      for OP in '+' '-' '*' '/' '%' '&' '|' '^'; do
+        printf 'int main(){ %s; %s; return ((a %s b) > 0) + 2*((a %s b) == 0) + 4*(sizeof(a %s b)); }\n' \
+               "$A" "$B" "$OP" "$OP" "$OP" > "$d/m.c"
+        _n=$((_n + 1))
+        "$CCBIN" "$d/m.c" -o "$d/m.bin" 2>/dev/null && "$d/m.bin"; _got=$?
+        gcc -w "$d/m.c" -o "$d/m.ref" 2>/dev/null && "$d/m.ref"; _want=$?
+        if [ "$_got" != "$_want" ]; then
+          _bad=$((_bad + 1))
+          [ "$_bad" -le 3 ] && printf 'FAIL  %s; %s; a %s b  (got %s, gcc %s)\n' "$A" "$B" "$OP" "$_got" "$_want"
+        fi
+      done
+    done
+  done
+  if [ "$_bad" = 0 ]; then
+    pass=$((pass + 1))
+    printf 'ok    %d operand/operator combinations agree with gcc on sign, zero and sizeof\n' "$_n"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  %d of %d combinations disagree with gcc\n' "$_bad" "$_n"
+  fi
+  rm -rf "$d"
+}
+promotion_matrix
+
+# Shifts get their own sweep because they are not symmetric and because the
+# count has to stay in range -- a negative or oversized count is undefined,
+# so the matrix above (which uses -5 as an operand) cannot include them.
+# Without this, promoting the left operand of a shift was untested: the
+# mutation that removed it survived everything else.
+shift_matrix() {
+  d=$T.shift
+  rm -rf "$d"; mkdir -p "$d"
+  _n=0; _bad=0
+  for A in 'char a=-3' 'short a=-3' 'int a=-3' 'long a=-3' \
+           'unsigned char a=3' 'unsigned short a=3' 'unsigned a=3' 'unsigned long a=3'; do
+    for OP in '<<' '>>'; do
+      for N in 0 1 3; do
+        printf 'int main(){ %s; return ((a %s %s) > 0) + 2*((a %s %s) == 0) + 4*(sizeof(a %s %s)); }\n' \
+               "$A" "$OP" "$N" "$OP" "$N" "$OP" "$N" > "$d/s.c"
+        _n=$((_n + 1))
+        "$CCBIN" "$d/s.c" -o "$d/s.bin" 2>/dev/null && "$d/s.bin"; _got=$?
+        gcc -w "$d/s.c" -o "$d/s.ref" 2>/dev/null && "$d/s.ref"; _want=$?
+        if [ "$_got" != "$_want" ]; then
+          _bad=$((_bad + 1))
+          [ "$_bad" -le 3 ] && printf 'FAIL  %s; a %s %s  (got %s, gcc %s)\n' "$A" "$OP" "$N" "$_got" "$_want"
+        fi
+      done
+    done
+  done
+  if [ "$_bad" = 0 ]; then
+    pass=$((pass + 1))
+    printf 'ok    %d shift combinations agree with gcc on sign, zero and sizeof\n' "$_n"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  %d of %d shift combinations disagree with gcc\n' "$_bad" "$_n"
+  fi
+  rm -rf "$d"
+}
+shift_matrix
+
+# The two divergences that prompted the sweep, kept as named cases so a
+# regression says what broke rather than "one of 320".
+check 1   'int main(){ unsigned u=0; return (u-1) > 0; }'
+check 4   'int main(){ short a=1; return sizeof(+a); }'
+check 1   'int main(){ unsigned long u=1; int i=-1; return (u+i) == 0; }'
+
 #__APPEND_BELOW__
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

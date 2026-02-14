@@ -477,6 +477,32 @@ static bool is_aggregate(Type *t) { return t->kind == TY_STRUCT || t->kind == TY
 // A function joins arrays and aggregates here: its "value" is its address.
 // Without it, loading a function designator emits mov (%rax), %rax and
 // dereferences the first instruction of the code.
+// Does this binary operation compare and divide as unsigned?
+//
+// C 6.3.1.8's usual arithmetic conversions decide it from BOTH operands, and
+// reading only the left one is wrong in a way the parser makes easy to miss:
+// "x > 5" is built as ND_LT with the operands swapped, so the literal ends up
+// on the left. An unsigned x therefore compared signed, while "x < 5" on the
+// same variable compared unsigned.
+//
+// The rule, for the integer types this compiler has:
+//   - promote anything narrower than int to signed int, since an int holds
+//     every value an unsigned char or unsigned short can have
+//   - the wider rank wins outright, which is why "long < unsigned int" stays
+//     signed on LP64: a long represents every unsigned int
+//   - at equal rank, unsigned wins
+static bool op_unsigned(Type *a, Type *b) {
+  if (is_pointer(a) || is_pointer(b)) return true;   // addresses never go negative
+
+  int asz = a->size < 4 ? 4 : a->size;
+  int bsz = b->size < 4 ? 4 : b->size;
+  bool au = a->size < 4 ? false : a->is_unsigned;
+  bool bu = b->size < 4 ? false : b->is_unsigned;
+
+  if (asz != bsz) return asz > bsz ? au : bu;
+  return au || bu;
+}
+
 static bool is_address_valued(Type *t) {
   return t->kind == TY_ARRAY || t->kind == TY_FUNC || is_aggregate(t);
 }
@@ -630,6 +656,26 @@ static bool is_lvalue(Node *n) {
   }
 }
 
+// Integer promotion: anything narrower than int becomes a signed int,
+// because an int holds every value such a type can have.
+static Type *promoted(Type *t) {
+  if (!is_integer(t)) return t;
+  if (t->size < 4) return ty_int;
+  return t;
+}
+
+// The type of a binary arithmetic result, per C 6.3.1.8. The width is the
+// wider of the two after promotion; the signedness is op_unsigned()'s
+// answer, so that the type and the instruction selected for it can never
+// disagree again.
+static Type *arith_result(Type *a, Type *b) {
+  Type *pa = promoted(a), *pb = promoted(b);
+  bool wide = pa->size == 8 || pb->size == 8;
+  bool uns = op_unsigned(pa, pb);
+  if (wide) return uns ? ty_ulong : ty_long;
+  return uns ? ty_uint : ty_int;
+}
+
 static void add_type(Node *n) {
   if (!n || n->ty) return;
 
@@ -642,12 +688,39 @@ static void add_type(Node *n) {
   switch (n->kind) {
   case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV: case ND_MOD:
   case ND_BITAND: case ND_BITOR: case ND_BITXOR:
-    // Integer promotion, crudely: anything narrower than long becomes int,
-    // and if either side is long the result is long.
-    n->ty = (n->lhs->ty->kind == TY_LONG || n->rhs->ty->kind == TY_LONG) ? ty_long : ty_int;
+    // The usual arithmetic conversions, using the same rule the code
+    // generator uses to pick its instructions. They used to disagree: the
+    // type dropped unsignedness entirely ("crudely", as the old comment
+    // admitted), so "u - 1" on an unsigned u produced the right VALUE and
+    // then claimed to be an int, and "(u-1) > 0" compared it signed.
+    // The usual arithmetic conversions CONVERT the operands; they do not
+    // merely describe the result. Computing only the result type leaves a
+    // narrow operand to be widened by whatever the load instruction
+    // happened to do, and a plain 32-bit load zero-extends: "u + i" with an
+    // unsigned long u and an int i of -1 added 0x00000000FFFFFFFF instead
+    // of -1, and came out one greater than zero instead of exactly zero.
+    if (is_integer(n->lhs->ty) && is_integer(n->rhs->ty)) {
+      Type *rty = arith_result(n->lhs->ty, n->rhs->ty);
+      if (n->lhs->ty != rty) n->lhs = new_cast(n->lhs, rty);
+      if (n->rhs->ty != rty) n->rhs = new_cast(n->rhs, rty);
+      n->ty = rty;
+    } else {
+      n->ty = arith_result(n->lhs->ty, n->rhs->ty);
+    }
     return;
-  case ND_NEG: case ND_BITNOT: case ND_SHL: case ND_SHR:
-    n->ty = (n->lhs->ty->kind == TY_LONG) ? ty_long : ty_int;
+  case ND_SHL: case ND_SHR:
+    // A shift is not symmetric. The result is the promoted left operand;
+    // the count contributes nothing to the type.
+    if (is_integer(n->lhs->ty)) {
+      Type *rty = promoted(n->lhs->ty);
+      if (n->lhs->ty != rty) n->lhs = new_cast(n->lhs, rty);
+      n->ty = rty;
+    } else {
+      n->ty = promoted(n->lhs->ty);
+    }
+    return;
+  case ND_NEG: case ND_BITNOT:
+    n->ty = promoted(n->lhs->ty);
     return;
   case ND_ASSIGN:
     if (n->lhs->ty->kind == TY_ARRAY) error_at(n->tok->loc, "not an lvalue");
@@ -1973,7 +2046,13 @@ static Node *postfix(void) {
 // unary = ("+" | "-" | "*" | "&" | "!" | "~" | "++" | "--") unary | postfix
 static Node *unary(void) {
   Token *tok = tk;
-  if (consume("+")) return cast_expr();
+  // Unary plus is not a no-op: it promotes. "sizeof(+a)" on a short is 4,
+  // and returning the operand untouched made it 2.
+  if (consume("+")) {
+    Node *n = cast_expr();
+    add_type(n);
+    return is_integer(n->ty) ? new_cast(n, promoted(n->ty)) : n;
+  }
   if (consume("-")) { Node *n = new_unary(ND_NEG, cast_expr(), tok); add_type(n); return n; }
   if (consume("*")) { Node *n = new_unary(ND_DEREF, cast_expr(), tok); add_type(n); return n; }
   if (consume("&")) { Node *n = new_unary(ND_ADDR, cast_expr(), tok); add_type(n); return n; }
@@ -3879,32 +3958,6 @@ static void gen_cast(Type *from, Type *to) {
   if (to->size == 1)      emit(to->is_unsigned ? "movzbl %%al, %%eax" : "movsbl %%al, %%eax");
   else if (to->size == 2) emit(to->is_unsigned ? "movzwl %%ax, %%eax" : "movswl %%ax, %%eax");
   else if (to->size == 4) emit("mov %%eax, %%eax");     // truncate to 32 bits
-}
-
-// Does this binary operation compare and divide as unsigned?
-//
-// C 6.3.1.8's usual arithmetic conversions decide it from BOTH operands, and
-// reading only the left one is wrong in a way the parser makes easy to miss:
-// "x > 5" is built as ND_LT with the operands swapped, so the literal ends up
-// on the left. An unsigned x therefore compared signed, while "x < 5" on the
-// same variable compared unsigned.
-//
-// The rule, for the integer types this compiler has:
-//   - promote anything narrower than int to signed int, since an int holds
-//     every value an unsigned char or unsigned short can have
-//   - the wider rank wins outright, which is why "long < unsigned int" stays
-//     signed on LP64: a long represents every unsigned int
-//   - at equal rank, unsigned wins
-static bool op_unsigned(Type *a, Type *b) {
-  if (is_pointer(a) || is_pointer(b)) return true;   // addresses never go negative
-
-  int asz = a->size < 4 ? 4 : a->size;
-  int bsz = b->size < 4 ? 4 : b->size;
-  bool au = a->size < 4 ? false : a->is_unsigned;
-  bool bu = b->size < 4 ? false : b->is_unsigned;
-
-  if (asz != bsz) return asz > bsz ? au : bu;
-  return au || bu;
 }
 
 static void gen_expr(Node *n) {
