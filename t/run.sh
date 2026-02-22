@@ -814,6 +814,21 @@ shift_matrix() {
 }
 shift_matrix
 
+# A short fuzz run, so that `make test` notices a gross codegen regression
+# without waiting for `make fuzz`. Twenty seeds catches the planted defects
+# measured in the README roughly half the time; the point here is a smoke
+# test, and the volume lives in the other target.
+fuzz_smoke() {
+  if CCBIN="$CCBIN" ./t/fuzz.sh 1 20 > "$T.fuzz" 2>&1; then
+    pass=$((pass + 1)); printf 'ok    %s\n' "$(tail -1 "$T.fuzz")"
+  else
+    fail=$((fail + 1)); printf 'FAIL  random programs disagree with gcc and clang\n'
+    grep '^FAIL' "$T.fuzz" | head -3 | sed 's/^/        /'
+  fi
+  rm -f "$T.fuzz"
+}
+fuzz_smoke
+
 # The two divergences that prompted the sweep, kept as named cases so a
 # regression says what broke rather than "one of 320".
 check 1   'int main(){ unsigned u=0; return (u-1) > 0; }'
