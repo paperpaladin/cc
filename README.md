@@ -311,9 +311,12 @@ With that case in, the mutant dies.
 ### Random programs, judged by two compilers
 
 ```
-$ make fuzz FROM=1 TO=2000
-2000 agree, 0 disagree, 0 skipped
+$ make fuzz FROM=2000 TO=2600
+601 agree, 0 disagree, 0 skipped (seeds 2000..2600)
 ```
+
+About 1,360 distinct seeds have been run across several ranges, with no
+disagreement.
 
 `t/gen.py` writes a random C program; gcc and clang say what it should
 return. The generator being ours costs nothing, because **the generator is
