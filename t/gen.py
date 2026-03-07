@@ -32,11 +32,37 @@ import sys
 
 BINOPS = ["+", "-", "*", "|", "&", "^"]
 
+# Narrow types exist here to exercise the integer promotions, which is where
+# the type system and the code generator have to agree. Keeping that defined
+# needs care: "a + b" on two chars is INT arithmetic, and signed int overflow
+# is undefined. So the values are bounded, and every sum, difference and
+# product of two of them fits in an int with room to spare.
+#
+# A SIGNED type must be able to hold a NEGATIVE value, or the whole exercise
+# is pointless. The first version masked everything to 0..127, so the sign
+# bit was never set and a signed load was indistinguishable from an unsigned
+# one -- planting "load a signed char with movzbl instead of movsbl" was
+# caught by zero seeds out of a hundred. Signed types now land in -64..63,
+# which still keeps a*b inside 4096.
+#
+# Each entry is (type, expression template for a value of that type).
+NARROW = [
+    ("signed char",    "(signed char)((%s & 0x7FUL) - 64)"),
+    ("short",          "(short)((%s & 0x7FUL) - 64)"),
+    ("int",            "(int)((%s & 0x7FUL) - 64)"),
+    ("unsigned char",  "(unsigned char)(%s & 0xFFUL)"),
+    ("unsigned short", "(unsigned short)(%s & 0xFFFUL)"),
+    ("unsigned int",   "(unsigned int)(%s & 0xFFFFUL)"),
+]
+
 
 class Gen:
     def __init__(self, seed):
         self.r = random.Random(seed)
-        self.vars = []
+        self.vars = []      # unsigned long, the accumulator type
+        self.narrow = []    # (name, ctype) for the promotion cases
+        self.arrays = []    # (name, length)
+        self.structs = []   # names of struct P values
         self.lines = []
 
     # ---- expressions ------------------------------------------------------
@@ -47,6 +73,15 @@ class Gen:
             if self.vars and r.random() < 0.7:
                 return r.choice(self.vars)
             return "%dUL" % r.randint(0, 1 << 32)
+
+        if self.narrow and r.random() < 0.12:
+            return self.narrow_expr()
+        if self.narrow and r.random() < 0.10:
+            return self.narrow_call()
+        if self.arrays and r.random() < 0.12:
+            return self.array_expr()
+        if self.structs and r.random() < 0.08:
+            return self.struct_expr()
 
         k = r.random()
         if k < 0.55:
@@ -82,6 +117,83 @@ class Gen:
         self.lines.append("  unsigned long %s = %s;" % (name, self.expr(2)))
         self.vars.append(name)
 
+    def observe(self, value):
+        """Fold a value into the accumulator.
+
+        Every construct does this, and it is the difference between a
+        fuzzer and a program generator. Without it a construct can be
+        emitted, be wrong, and never reach the exit status -- which is
+        measurable: planting "pass a struct in one register instead of
+        two" was caught by 1 seed in 100 when struct values only sometimes
+        flowed to the result, because the other 99 computed a wrong number
+        and then threw it away."""
+        self.lines.append("  acc = acc * 31UL + (%s);" % value)
+
+    def decl_narrow(self):
+        ty, tmpl = self.r.choice(NARROW)
+        name = "n%d" % len(self.narrow)
+        self.lines.append("  %s %s = %s;" % (ty, name, tmpl % self.expr(1)))
+        self.narrow.append((name, ty))
+        # Observed twice, and both are deliberate.
+        #
+        # Directly, as a long rather than an unsigned long, so a
+        # sign-extension bug on a negative value changes the answer.
+        self.observe("(unsigned long)(long)%s" % name)
+        # And through a call that widens it, because that is the only shape
+        # that can see a missing conversion at the CALL site. Done here,
+        # for every narrow variable, rather than left to a random statement
+        # kind: when it was probabilistic it fired in 13 programs out of a
+        # hundred and caught the planted defect in 1.
+        self.observe("(unsigned long)widen(%s, %s)" % (name, name))
+
+    def narrow_call(self):
+        """Pass narrow values through a call. Nothing else here does, so the
+        part of the prologue that stores a one- or two-byte argument into
+        its slot was never executed -- planting "store it full width
+        instead" was caught by zero seeds."""
+        r = self.r
+        a, _ = r.choice(self.narrow)
+        b, _ = r.choice(self.narrow)
+        return "(unsigned long)narrow(%s, %s)" % (a, b)
+
+    def narrow_expr(self):
+        """An expression over narrow variables, which is where the integer
+        promotions actually happen: "a + b" on two chars is int arithmetic,
+        and the result type decides whether the comparison after it is
+        signed. The operands are bounded on assignment so this cannot
+        overflow an int."""
+        r = self.r
+        a, _ = r.choice(self.narrow)
+        b, _ = r.choice(self.narrow)
+        op = r.choice(["+", "-", "*", "&", "|", "^"])
+        return "(unsigned long)(%s %s %s)" % (a, op, b)
+
+    def decl_array(self):
+        n = self.r.randint(2, 5)
+        name = "a%d" % len(self.arrays)
+        vals = ", ".join("%dUL" % self.r.randint(0, 1 << 20) for _ in range(n))
+        self.lines.append("  unsigned long %s[%d] = {%s};" % (name, n, vals))
+        self.arrays.append((name, n))
+        self.observe("%s[%d]" % (name, self.r.randrange(n)))
+
+    def array_expr(self):
+        name, n = self.r.choice(self.arrays)
+        # The index is masked into range, so there is never an out-of-bounds
+        # read -- which would be undefined and would make the references
+        # disagree for reasons that say nothing about us.
+        return "%s[(%s) %% %dUL]" % (name, self.expr(1), n)
+
+    def decl_struct(self):
+        name = "s%d" % len(self.structs)
+        self.lines.append("  struct P %s; %s.a = %s; %s.b = %s;" %
+                          (name, name, self.expr(1), name, self.expr(1)))
+        self.structs.append(name)
+        self.observe("fold(%s)" % name)
+
+    def struct_expr(self):
+        s = self.r.choice(self.structs)
+        return "fold(%s)" % s
+
     def assign(self):
         if not self.vars:
             return self.decl()
@@ -92,9 +204,12 @@ class Gen:
         are dropped from the live set afterwards -- otherwise the final fold
         references names that no longer exist, and every compiler rejects
         the program rather than disagreeing about it."""
-        mark = len(self.vars)
+        marks = (len(self.vars), len(self.narrow), len(self.arrays), len(self.structs))
         self.block(depth)
-        del self.vars[mark:]
+        del self.vars[marks[0]:]
+        del self.narrow[marks[1]:]
+        del self.arrays[marks[2]:]
+        del self.structs[marks[3]:]
 
     def if_stmt(self, depth):
         self.lines.append("  if (%s) {" % self.cond(2))
@@ -122,29 +237,75 @@ class Gen:
             self.decl(); self.decl()
         a, b = self.r.sample(self.vars, 2)
         self.lines.append("  %s = mix(%s, %s);" % (self.r.choice(self.vars), a, b))
+        # Wide values into narrow parameters, which is the only shape that
+        # needs a conversion AT THE CALL. Passing an already-narrow variable
+        # makes the conversion a no-op, and removing it was caught by zero
+        # seeds.
+        self.observe("(unsigned long)narrow(%s, %s)" % (a, b))
+
+    def widen_call(self):
+        """Narrow values into wide parameters. This is the only shape that
+        can see a missing conversion AT THE CALL: a signed char in a
+        register says nothing about its top 56 bits, and the callee reading
+        a long is far too late to fix it. The opposite direction cannot,
+        because the callee truncates into its own slot and is right either
+        way."""
+        a, _ = self.r.choice(self.narrow)
+        b, _ = self.r.choice(self.narrow)
+        self.observe("(unsigned long)widen(%s, %s)" % (a, b))
 
     def block(self, depth):
-        for _ in range(self.r.randint(1, 3)):
+        for _ in range(self.r.randint(1, 4)):
             k = self.r.random()
-            if k < 0.35 or not self.vars:
+            if k < 0.26 or not self.vars:
                 self.decl()
-            elif k < 0.60:
+            elif k < 0.42:
                 self.assign()
-            elif k < 0.75 and depth > 0:
+            elif k < 0.52:
+                self.decl_narrow()
+            elif k < 0.60:
+                self.decl_array()
+            elif k < 0.66:
+                self.decl_struct()
+            elif k < 0.78 and depth > 0:
                 self.if_stmt(depth)
-            elif k < 0.88 and depth > 0:
+            elif k < 0.86 and depth > 0:
                 self.loop(depth)
+            elif k < 0.94 and self.narrow:
+                self.widen_call()
             else:
                 self.call()
 
     def program(self):
+        self.lines.append("struct P { unsigned long a, b; };")
         self.lines.append("unsigned long mix(unsigned long a, unsigned long b) {")
         self.lines.append("  return (a * 3UL) ^ (b + 7UL) ^ (a >> 3UL);")
         self.lines.append("}")
+        # A 16-byte struct is two integer registers by the SysV rules, so
+        # calling this exercises the classification rather than a memcpy.
+        # Narrow parameters, so the prologue path that stores a one- or
+        # two-byte argument is reached. The body sign-extends by returning
+        # a long, which is where a wrong load shows up.
+        self.lines.append("long narrow(signed char a, unsigned short b) {")
+        self.lines.append("  return (long)a * 3L + (long)b;")
+        self.lines.append("}")
+        # And the other direction. Passing a WIDE value to a narrow
+        # parameter cannot test the conversion at the call, because the
+        # callee truncates into its own one-byte slot and gets the right
+        # answer either way -- the same vacuity as g(300) in the README.
+        # Only widening can see it: a signed char in a register says
+        # nothing about its top 56 bits, and the callee is too late.
+        self.lines.append("long widen(long a, long b) {")
+        self.lines.append("  return a * 7L - b;")
+        self.lines.append("}")
+        self.lines.append("unsigned long fold(struct P p) {")
+        self.lines.append("  return (p.a ^ (p.b * 5UL)) + (p.a >> 7UL);")
+        self.lines.append("}")
         self.lines.append("int main(void) {")
+        self.lines.append("  unsigned long acc = 0UL;")
         self.block(3)
         total = " ^ ".join(self.vars) if self.vars else "0UL"
-        self.lines.append("  unsigned long result = %s;" % total)
+        self.lines.append("  unsigned long result = acc ^ (%s);" % total)
         # 251 is prime, so a wrong answer is unlikely to agree in the low
         # eight bits by coincidence.
         self.lines.append("  return (int)(result % 251UL);")
