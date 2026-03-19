@@ -563,6 +563,20 @@ the whole suite.
 ### Milestone 3 -- only after the above is green
 
 - [ ] 22 replace the stack machine with a register allocator; keep the fixpoint green
+      note: two cheap cases are already taken, and they are only worth 3%:
+            a leaf right operand goes straight into %rdi, and a call whose
+            arguments are all leaves loads each into its own register. On a
+            frozen 4,677-line input that is 38,946 instructions down to
+            37,646, against gcc -O0's 15,925. The remaining 2.4x is the
+            allocator, not peepholes.
+            Two things learned while taking them. Staging an argument
+            through a scratch register costs the same two instructions the
+            push/pop pair did and destroys whatever is already in that
+            register -- loading directly into the target is the only
+            version that wins. And a no-op cast is not free: funcall was
+            wrapping every argument in a cast to the type it already had,
+            which hid the operand from every later question about whether
+            it was simple.
 - [ ] 23 emit ELF objects directly, dropping the `gcc` dependency (see ../ld)
 
 ## Open questions
