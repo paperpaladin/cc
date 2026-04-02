@@ -172,7 +172,7 @@ It compiles itself. See the top of this file.
 
 ## Design
 
-One file. Splitting a 1,200-line compiler into `lex.c`/`parse.c`/`codegen.c`
+One file. Splitting a 4,764-line compiler into `lex.c`/`parse.c`/`codegen.c`
 buys nothing while it still fits in a single screen of `ctags`, and a single
 translation unit is easier to self-host later.
 
@@ -183,9 +183,11 @@ ceiling:
   pushes and pops its operands. Two cases avoid it -- a leaf right operand
   goes straight into `%rdi`, and a call whose arguments are all leaves
   loads each one directly into its own register -- which is worth about 3%
-  and is not a fix. Compiling this compiler's own 4,677 lines emits 37,646
-  instructions against `gcc -O0`'s 15,925, so the gap is still 2.4x and
-  closing it means a real register allocator (PLAN item 22).
+  and is not a fix. Compiling this compiler's own source emitted 37,646
+  instructions against `gcc -O0`'s 15,925 -- a 2.4x gap -- measured on a
+  frozen 4,677-line snapshot of `cc.c` that is **not committed**, so the
+  figure cannot be re-run from this repo and `cc.c` is 4,764 lines now.
+  Closing the gap means a real register allocator (PLAN item 22).
 
   Measuring this needs a *frozen* input, which is not obvious until it
   bites: the first numbers here compared the compiler's output on `cc.c`
