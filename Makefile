@@ -32,8 +32,12 @@ self-host: cc
 # detect_leaks=0 is a decision, not a convenience. This compiler frees
 # nothing on purpose -- see the Design section of the README -- so every run
 # ends holding its whole AST, and LeakSanitizer is correct every time it
-# complains. Leaving it on would mean 236 failures that all say the same
-# known thing, which is the fastest way to stop reading the output. What is
+# complains. Leaving it on fails EVERY case -- measured: `detect_leaks=1`
+# gives "0 passed, 325 failed" -- because every run ends holding its AST, so
+# the number is just the case count. (This said 236 and the README said 237;
+# both were absolutes for a figure that tracks the suite's size, which is why
+# they drifted apart and away from the truth.) All of them saying the same
+# known thing is the fastest way to stop reading the output. What is
 # being asked here is whether the compiler reads or writes memory it does not
 # own, and that question is still fully answered.
 test-asan: cc.c
@@ -47,7 +51,10 @@ test-asan: cc.c
 diff-test: cc
 	@./t/differential.sh
 
+# -rf, not -f: t/tmp*.promo and t/tmp*.shift are directories, left behind
+# whenever a run.sh is interrupted, and `rm -f` on a directory fails -- so
+# `make clean` exited 2 in any tree that had one.
 clean:
-	rm -f cc cc-asan *.s *.cc.s a.out t/tmp* t/fuzz-fail-*.c
+	rm -rf cc cc-asan *.s *.cc.s a.out t/tmp* t/fuzz-fail-*.c
 
 .PHONY: test test-asan self-host fuzz diff-test clean

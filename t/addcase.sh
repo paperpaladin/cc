@@ -3,7 +3,7 @@
 #
 #   ./t/addcase.sh 'int main() { return 1+1; }'
 #
-# Three of my hand-computed expectations have been wrong so far, every one of them
+# Five of my hand-computed expectations have been wrong so far, every one of them
 # costing a detour through "is this a codegen bug?". gcc already knows the answer,
 # so stop guessing: compile with gcc, run it, record what it returns. clang is
 # consulted too -- if the two disagree the program is relying on undefined

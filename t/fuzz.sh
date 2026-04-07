@@ -87,8 +87,12 @@ printf '\n%d agree, %d disagree, %d skipped (seeds %s..%s)\n' \
 # programs gcc rejects, every seed would take the `skipped` path and this
 # script would exit 0 having compared nothing.
 if [ "$agree" -eq 0 ]; then
+  # FIRST and LAST, not to and from: those names do not exist, and `set -u`
+  # does not catch it because arithmetic expansion treats an unset name as 0,
+  # so this printed "0 skipped of 1" whatever the range was. The gate itself
+  # was right; only the message on the never-taken path was wrong.
   printf 'FAIL  no seed produced a comparison: %s skipped of %s\n' \
-    "$skipped" "$((to - from + 1))"
+    "$skipped" "$((LAST - FIRST + 1))"
   exit 1
 fi
 [ "$disagree" -eq 0 ]
