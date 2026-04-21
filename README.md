@@ -14,8 +14,8 @@ $ ./cc examples/fib.c -o fib && ./fib; echo $?
 A compiler is the only project I know of where the test oracle is completely
 outside the author's control. Either `gcc` and `clang` agree with your output or
 they don't, and no amount of confidence changes the exit code. Everything here
-is organized around that: the real test suite doesn't contain a single
-hand-written expected value.
+is organised around that. The real test suite contains no hand-written
+expected value anywhere in it.
 
 That turned out to matter on the first run. Two cases failed, I assumed two
 codegen bugs, and both were wrong expectations I had computed by hand
@@ -36,10 +36,10 @@ ok   cc2 builds an ordinary program through real headers
 6 passed, 0 failed
 ```
 
-The fixpoint is the hard invariant this project was built around, and it is
-worth being precise about what it proves. It says the compiler is a *fixed
-point of itself*: whatever `cc2` does differently from `cc`, it does
-consistently enough to reproduce itself byte for byte. A miscompilation on
+The fixpoint is this project's hard invariant, and what it proves is
+narrower than it first looks. The compiler is a *fixed point of itself*.
+Whatever `cc2` does differently from `cc`, it does consistently enough to
+reproduce itself byte for byte. A miscompilation on
 any path `cc.c` exercises shows up as `cc3` differing from `cc2`.
 
 It does not prove `cc2` is correct, and this is not a theoretical
@@ -47,8 +47,8 @@ caveat. At the first green `cmp cc2 cc3` here, `cc2` still failed 15 cases
 of `t/run.sh`. The fixpoint said *stable* and the suite said *wrong*, and
 the suite was right. A compiler that miscompiles itself self-consistently
 reaches a fixpoint perfectly happily. So `make self-host` runs the whole
-suite against the stage-2 compiler too, and that is the assertion with
-teeth.
+suite against the stage-2 compiler as well, and it is the second half that
+has teeth.
 
 ## Status
 
@@ -120,7 +120,7 @@ whole in the open unit starts a new one instead of straddling.
 Variadic definitions: `int sum(int n, ...)` with the SysV register
 save area, plus `va_list`, `va_start`, `va_arg`, `va_end` and `va_copy`
 predefined, so none of it needs a header. The real `<stdarg.h>` is GNU C
-from its first line, which is exactly the dependency this avoids.
+from its first line. Avoiding that dependency is the point.
 
 Global initialisers, scalars, arrays, nested arrays, structs, strings
 into `char` arrays, and addresses: `char *p = "abc"`, `int *p = &v`, `int *p
@@ -198,8 +198,8 @@ ceiling:
   figure cannot be re-run from this repo and `cc.c` is 4,764 lines now.
   Closing the gap means a real register allocator (PLAN item 22).
 
-  Measuring this needs a *frozen* input, which is not obvious until it
-  bites: the first numbers here compared the compiler's output on `cc.c`
+  Measuring this needs a *frozen* input. That is not obvious until it
+  bites. The first numbers here compared the compiler's output on `cc.c`
   before and after a change to `cc.c` itself, so a 2.4% improvement read as
   a 0.7% regression. The benchmark is now a fixed snapshot.
 - Nothing is freed. A compiler is a short-lived process; `exit` reclaims.
@@ -245,7 +245,7 @@ right and the standard's illustrative text is loose.
 `t/run.sh` holds the cases and asserts exit statuses. `t/differential.sh`
 re-runs the same cases but throws the expectations away and compares against gcc
 and clang instead, if the two reference compilers disagree with each other the
-case is skipped as undefined behavior, not counted against us.
+case is skipped as undefined behaviour, not counted against us.
 
 Cases live in exactly one place. `differential.sh` greps them out of `run.sh`,
 not keeping a second copy in sync.
