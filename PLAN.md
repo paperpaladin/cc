@@ -19,7 +19,7 @@ The fixpoint. `cc` compiles itself:
 `cc` itself uses breaks this loudly, and it costs one `cmp`.
 
 Reached, and the qualification matters more than the milestone. The
-fixpoint proves the compiler is STABLE, not correct: at the first green
+fixpoint proves the compiler is STABLE, not correct. At the first green
 `cmp cc2 cc3`, cc2 still failed 15 cases of t/run.sh, because a compiler
 that miscompiles itself self-consistently reaches a fixpoint without
 complaint. The invariant is therefore the fixpoint AND the stage-2 compiler
@@ -584,7 +584,7 @@ the whole suite.
 - ~~`long double`: planning to alias it to `double` and document the lie.~~
   Resolved, and not the way this said. `long double` is declarable with its
   real 16-byte size and refuses to be operated on, so there is no lie left to
-  document. The differential suite is what settled it: the moment the type
+  document. The differential suite is what settled it. The moment the type
   became declarable, `sizeof(long double)` was a `check` asserting 8 against
   gcc and clang both saying 16, and a deliberate known-wrong answer turns out
   to be very hard to keep once something outside the repo gets a vote on it.

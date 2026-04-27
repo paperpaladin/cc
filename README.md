@@ -137,7 +137,7 @@ storage and so are emitted as globals under a generated name.
 Function prototypes, a declaration gives a call its return type, so
 `sizeof(f())` is right and a returned pointer can be dereferenced. Arguments
 are converted to their parameter types at the call, and the argument count is
-checked. `f(void)` and `f()` are kept apart: the first promises no arguments
+checked. `f(void)` and `f()` are kept apart. The first promises no arguments
 and is checked, the second promises nothing and is not. A call to an
 undeclared function still works and still assumes it returns `long`.
 
@@ -171,7 +171,7 @@ A call may pass at most six arguments, because there is no support for
 arguments on the stack. A *definition* may receive more than six through
 `va_arg`, which is how that path gets tested at all, gcc makes the call.
 The same gap is why a struct larger than 16 bytes cannot be passed by
-value: that is the MEMORY class, and it needs the thing that is missing.
+value. That is the MEMORY class, and it needs the thing that is missing.
 Every one of these is refused by name, and `t/run.sh` asserts the refusal
 with `unimpl()`, gcc must accept the program and we must reject it
 cleanly, because the failure mode of a missing feature is not a missing
@@ -189,7 +189,7 @@ Three deliberate corners, each marked `shortcut:` in the source with its
 ceiling:
 
 - Stack-machine codegen, no register allocator. Every binary operator
-  pushes and pops its operands. Two cases avoid it: a leaf right operand
+  pushes and pops its operands. Two cases avoid it. A leaf right operand
   goes straight into `%rdi`, and a call whose arguments are all leaves
   loads each one directly into its own register, which is worth about 3%
   and is not a fix. Compiling this compiler's own source emitted 37,646
@@ -231,7 +231,7 @@ see the mutation table below.
 
 Expansion puts tokens next to each other that were never adjacent in the
 source, and some of those pairs lex differently when printed touching. `2` and
-`+` are the dangerous case: a pp-number may contain an exponent, so `2+` is one
+`+` are the dangerous case. A pp-number may contain an exponent, so `2+` is one
 token to a conforming lexer. The printer therefore inserts a space wherever two
 adjacent tokens could glue, and the suite asserts the resulting guarantee
 directly, running `-E` over its own output must produce that output again.
@@ -308,7 +308,7 @@ were planted in the preprocessor one at a time:
 | an argument is substituted unexpanded | caught, 2 cases |
 | `#elif` is evaluated after a branch was taken | caught, 1 case |
 
-All seven. The fourth is the one worth having: it fails nothing about what the
+All seven. The fourth is the one worth having. It fails nothing about what the
 tokens *are*, only that printing them loses information, and it is caught only
 because the suite re-reads its own output instead of trusting it.
 
@@ -340,7 +340,7 @@ $ make fuzz FROM=2000 TO=2600
 About 1,360 distinct seeds have been run across several ranges, with no
 disagreement.
 
-`t/gen.py` writes a random C program. Gcc and clang say what it should
+`t/gen.py` writes a random C program. gcc and clang say what it should
 return. The generator being ours costs nothing, because **the generator is
 not the oracle**.
 
@@ -351,7 +351,7 @@ are each entitled to a different answer, so a disagreement with us would
 prove nothing. Arithmetic is therefore done in `unsigned long`, where
 overflow is defined to wrap. Every divisor is `| 1` so it is odd and never
 zero. Every shift count is `& 63`. That is also the honest limit of what it
-can find: it will never catch a signed-overflow bug, because it never
+can find. It will never catch a signed-overflow bug, because it never
 generates one.
 
 If gcc and clang disagree with **each other**, the generator let undefined
@@ -375,7 +375,7 @@ Three of those numbers started at zero, and fixing them is most of what
 this generator is:
 
 Generating a construct is not exercising it. The first version emitted
-structs and narrow types, then threw most of their values away: a wrong
+structs and narrow types, then threw most of their values away, a wrong
 answer was computed and never reached the exit status. Every construct now
 folds into a running accumulator, which took "struct passed in one
 register" from 1 of 100 to 18.
@@ -397,7 +397,7 @@ The usual arithmetic conversions are verified by 368 generated expressions,
 every operand type against every integer operator, plus a separate sweep
 for shifts, which are not symmetric and whose count has to stay in range.
 
-Each is compared with gcc on three things at once: the sign of the
+Each is compared with gcc on three things at once. The sign of the
 result, whether it is zero, and its `sizeof`. That last one is the point. A
 wrong type very often computes the right number, and this item existed
 because of exactly that case: `u - 1` on an unsigned `u` produced precisely
@@ -426,7 +426,7 @@ because `>` and `<` put the operands in opposite positions:
 - an `unsigned char` promotes to signed `int`, so `x > -1` is true
 - an `unsigned int` widens to `long` on LP64, so `l < u` stays signed
 
-The first mutant written for this was itself wrong, and worth recording: it
+The first mutant written for this was itself wrong, and worth recording. It
 removed the promotion from the *left* operand while the test case had the
 narrow type on the *right*, so identical assembly came out and the mutant
 looked like it survived. A mutation test can be vacuous exactly like an
@@ -442,7 +442,7 @@ int n = t->str_len < ty->size ? t->str_len : ty->size;   // char s[3] = "hello"
 ```
 
 turns `char s[3] = "hello"` into a six-byte write into a three-byte buffer.
-The ordinary suite scores it 237 passed: the bytes it tramples are not ones
+The ordinary suite scores it 237 passed. The bytes it tramples are not ones
 the output depends on, so the program still returns 57 and every assertion
 holds. Under the sanitizer build the same case is a heap-buffer-overflow and
 the mutant dies. A test that drives the code over the bug and checks the
@@ -463,7 +463,7 @@ data structures comes close.
 The second case runs the other way. `va_arg`'s overflow branch: arguments
 seven and beyond, which arrive on the stack, not in registers, is
 unreachable from any program this compiler builds, because its own call path
-stops at six arguments. So the suite has gcc make the call: gcc compiles a
+stops at six arguments. So the suite has gcc make the call. It compiles a
 `main` that passes nine arguments to a variadic function we compiled,
 and links them together. Their calling convention, our prologue, our
 `va_arg`. Delete the `jae` that chooses the overflow path and only that one
