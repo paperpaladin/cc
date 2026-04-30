@@ -584,8 +584,7 @@ the whole suite.
 - ~~`long double`: planning to alias it to `double` and document the lie.~~
   Resolved, and not the way this said. `long double` is declarable with its
   real 16-byte size and refuses to be operated on, so there is no lie left to
-  document. The differential suite is what settled it. The moment the type
-  became declarable, `sizeof(long double)` was a `check` asserting 8 against
+  document. The differential suite is what settled it. As soon as the type became declarable, `sizeof(long double)` was a `check` asserting 8 against
   gcc and clang both saying 16, and a deliberate known-wrong answer turns out
   to be very hard to keep once something outside the repo gets a vote on it.
 - Struct assignment currently emits an unrolled byte copy, so a 4KB struct would

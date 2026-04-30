@@ -37,7 +37,7 @@ ok   cc2 builds an ordinary program through real headers
 ```
 
 The fixpoint is this project's hard invariant, and what it proves is
-narrower than it first looks. The compiler is a *fixed point of itself*.
+narrower than it first looks. It is a *fixed point of itself*.
 Whatever `cc2` does differently from `cc`, it does consistently enough to
 reproduce itself byte for byte. A miscompilation on
 any path `cc.c` exercises shows up as `cc3` differing from `cc2`.
@@ -67,8 +67,7 @@ are `printf`/`strlen` without a declaration, clang 19 defaults to C23, where
 implicit function declarations are an error, so it will not build them as a
 reference. The other five are every `va_list` case, including the
 `vsprintf` one this README calls the real oracle: `va_list` is a cc builtin,
-so gcc rejects those sources without `<stdarg.h>`. The variadic ABI is
-therefore not differential-tested at all, and that was invisible while the
+so gcc rejects those sources without `<stdarg.h>`. So the variadic ABI is not differential-tested at all, and that was invisible while the
 skip was silent.
 
 ### What works
@@ -201,7 +200,7 @@ ceiling:
   Measuring this needs a *frozen* input. That is not obvious until it
   bites. The first numbers here compared the compiler's output on `cc.c`
   before and after a change to `cc.c` itself, so a 2.4% improvement read as
-  a 0.7% regression. The benchmark is now a fixed snapshot.
+  a 0.7% regression. That benchmark is now a fixed snapshot.
 - Nothing is freed. A compiler is a short-lived process; `exit` reclaims.
 - `gcc` assembles and links. Writing an assembler is a different project.
 
@@ -442,7 +441,7 @@ int n = t->str_len < ty->size ? t->str_len : ty->size;   // char s[3] = "hello"
 ```
 
 turns `char s[3] = "hello"` into a six-byte write into a three-byte buffer.
-The ordinary suite scores it 237 passed. The bytes it tramples are not ones
+The ordinary suite scores it 237 passed. Bytes it tramples are not ones
 the output depends on, so the program still returns 57 and every assertion
 holds. Under the sanitizer build the same case is a heap-buffer-overflow and
 the mutant dies. A test that drives the code over the bug and checks the
@@ -481,8 +480,7 @@ The second is `va_list`: it is an array of one struct, per the ABI, and
 making it a plain struct changes nothing here. `is_address_valued()` is true
 for every aggregate in this compiler, so a struct yields its address exactly
 as an array does. The array is still correct and still what C specifies; it
-simply stops mattering until aggregates can be passed by value. The first
-version of this comment claimed the struct form would silently pass a copy,
+simply stops mattering until aggregates can be passed by value. Its first version claimed the struct form would silently pass a copy,
 which was a confident explanation of something that does not happen.
 
 ## Real headers
