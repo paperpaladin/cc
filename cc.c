@@ -3310,7 +3310,7 @@ static CondIncl *push_cond(Token *tok, bool included) {
 
 // Skip to the matching #else/#elif/#endif without expanding anything. Nested
 // conditionals are counted so that a #endif belonging to an inner #if does not
-// end the outer one -- and crucially nothing in here is evaluated, so a
+// end the outer one -- and nothing in here is evaluated, so a
 // disabled branch may contain syntax this compiler cannot parse.
 static Token *skip_cond_incl(Token *tok) {
   int depth = 0;
