@@ -8,3 +8,4 @@ t/tmp*
 t/dt.*
 t/cases.sh
 t/ref.bin
+scratch/

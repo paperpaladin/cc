@@ -19,6 +19,11 @@ TO = 200
 # The fixpoint, and the proof that the stage-2 compiler is more than stable.
 # Not folded into `test`: it builds the compiler three times and runs the
 # whole suite twice, which is minutes rather than seconds.
+# 220 small C programs written by other people. Not vendored: the corpus
+# gives no licence for the individual cases, so it is fetched, pinned to
+# one commit and checked by sha256. Skips loudly when offline.
+conformance: cc
+	@t/cts.sh
 self-host: cc
 	@./t/selfhost.sh
 
@@ -57,4 +62,4 @@ diff-test: cc
 clean:
 	rm -rf cc cc-asan *.s *.cc.s a.out t/tmp* t/fuzz-fail-*.c
 
-.PHONY: test test-asan self-host fuzz diff-test clean
+.PHONY: conformance test test-asan self-host fuzz diff-test clean
