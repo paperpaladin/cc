@@ -1725,6 +1725,34 @@ static Node *declaration(void) {
       continue;
     }
 
+    // A function declared inside a block declares a FUNCTION with
+    // external linkage, not an object (C11 6.2.2p5). It gets no storage
+    // and no stack slot. Falling through to new_var() gave it one, and
+    // the call then went through whatever those eight bytes held:
+    // c-testsuite 00078 segfaults on exactly that, where gcc compiles
+    // the same program to something that exits 0.
+    //
+    // Find-or-create, as a file-scope prototype does, so a block-scope
+    // declaration of something already declared or defined here binds
+    // to the one Obj instead of making a second symbol.
+    if (ty->kind == TY_FUNC) {
+      Obj *fn = NULL;
+      for (Obj *g = globals; g; g = g->next)
+        if (g->is_function && !strcmp(g->name, name)) { fn = g; break; }
+      if (!fn) {
+        fn = calloc(1, sizeof(Obj));
+        fn->name = name;
+        fn->ty = ty;
+        fn->is_function = true;
+        fn->next = globals;
+        globals = fn;
+      }
+      // The scope entry goes in the CURRENT block, which is what ends
+      // the declaration's visibility with the block, as C says.
+      push_scope(name)->var = fn;
+      continue;
+    }
+
     Obj *var = new_var(name, ty, true);
 
     if (consume("=")) {

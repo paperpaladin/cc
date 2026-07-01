@@ -543,8 +543,18 @@ the whole suite.
              __LP64__.
              00218 prints "unsigned enum bit-fields broken".
              00206 differs from the expected output later in the stream.
-- [ ] 24 fix the four miscompilations c-testsuite found, one commit per
-      root cause
+- [ ] 24 fix the remaining three miscompilations c-testsuite found, one
+      commit per root cause
+      done: 00078, the block-scope function declaration, fixed. A
+            function declared inside a block declares a function with
+            external linkage and no storage (C11 6.2.2p5); it was
+            falling through to the local-variable path, getting a stack
+            slot, and the call went through those eight bytes. Four
+            cases added to t/run.sh, because the corpus is fetched and
+            skips offline, and a fix with no local test is a fix waiting
+            to be undone.
+      left: 00212 (no __LP64__ predefined), 00218 (unsigned enum
+            bit-fields), 00206 (output diverges later in the stream).
       why: cc's whole argument is that a missing feature must be a
            refusal and never a wrong answer. Four cases say otherwise,
            and they were invisible until a corpus nobody here wrote was

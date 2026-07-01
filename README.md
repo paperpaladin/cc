@@ -29,7 +29,7 @@ $ make self-host
 ok   stage 1: cc compiles cc.c
 ok   stage 2: cc2 compiles cc.c
 ok   the fixpoint: cc2 and cc3 are byte-identical
-ok   cc2 passes t/run.sh  (325 passed, 0 failed)
+ok   cc2 passes t/run.sh  (329 passed, 0 failed)
 ok   cc2 passes t/cpp.sh  (64 passed, 0 failed)
 ok   cc2 builds an ordinary program through real headers
 
@@ -54,7 +54,7 @@ has teeth.
 
 ```
 $ make test        # exit-status assertions; two harnesses, two summaries
-325 passed, 0 failed
+329 passed, 0 failed
 64 passed, 0 failed
 
 $ make diff-test   # the oracle that matters
@@ -268,11 +268,11 @@ the published torture tests for rescanning, `#`, `##` and variadic macros.
 
 ```
 $ make test
-325 passed, 0 failed
+329 passed, 0 failed
 64 passed, 0 failed
 
 $ make test-asan        # the same suite, watched
-325 passed, 0 failed
+329 passed, 0 failed
 64 passed, 0 failed
 ```
 
@@ -487,14 +487,12 @@ which was a confident explanation of something that does not happen.
 
 ```
 $ make conformance
-c-testsuite: 182 of 220 pass (82%)
+c-testsuite: 183 of 220 pass (83%)
   no regressions against t/cts-baseline.txt
   by kind:
        34 refused
         3 MISCOMPILED-stdout
-        1 MISCOMPILED-signal
   accepted and then wrong, which is the bad kind:
-    00078 MISCOMPILED-signal11
     00206 MISCOMPILED-stdout
     00212 MISCOMPILED-stdout
     00218 MISCOMPILED-stdout
@@ -510,8 +508,8 @@ The two kinds of failure are never merged into one number. A refusal is
 a gap: cc declined, which is the honest answer to a feature it does not
 have. A miscompilation is a bug: cc accepted the program and produced a
 binary that crashed or printed the wrong thing. Thirty-four of the
-thirty-eight failures are the first kind. Four are the second, and they
-were invisible until this ran.
+thirty-seven failures are the first kind. Three are the second, and all
+four of the originals were invisible until this ran.
 
 The smallest of them is six lines:
 
@@ -524,8 +522,17 @@ int main(void) {
 }
 ```
 
-gcc compiles that to something that exits 0. cc compiles it to something
-that segfaults. Delete the inner declaration and cc is correct again.
+gcc compiled that to something that exits 0 and cc compiled it to
+something that segfaulted. A function declared inside a block declares a
+function with external linkage and no storage, C11 6.2.2p5, and it was
+falling through to the local-variable path, taking a stack slot, so the
+call went through whatever those eight bytes held. Fixed, with four
+cases added to `t/run.sh`: the corpus is fetched and skips offline, and
+a fix with no local test is a fix waiting to be undone.
+
+Three remain, and they are item 24: no `__LP64__` predefined, unsigned
+enum bit-fields, and one case whose output diverges later in the
+stream.
 
 The gate is no regression rather than a pass rate, since cc implements a
 subset on purpose and most of these failures are expected. The baseline
