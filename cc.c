@@ -3551,8 +3551,38 @@ static void init_macros(void) {
   define_text("__UINTMAX_TYPE__ unsigned long");
 
   define_text("__STDC__ 1");
+
+  // Platform. Every one of these is a macro gcc predefines with the same
+  // value, checked by predefine_test() in t/run.sh, which compiles the
+  // same program with both and compares. The omissions are deliberate:
+  // __SIZEOF_INT128__, __SIZEOF_FLOAT80__ and __SIZEOF_FLOAT128__ would
+  // advertise types this compiler does not have, and a header that acts
+  // on them produces a miscompilation rather than a missing feature.
   define_text("__x86_64__ 1");
+  define_text("__amd64 1");
+  define_text("__amd64__ 1");
   define_text("__linux__ 1");
+  define_text("__linux 1");
+  define_text("__gnu_linux__ 1");
+  define_text("__unix 1");
+  define_text("__unix__ 1");
+  define_text("__ELF__ 1");
+  define_text("__LP64__ 1");
+  define_text("_LP64 1");
+
+  define_text("__ORDER_LITTLE_ENDIAN__ 1234");
+  define_text("__ORDER_BIG_ENDIAN__ 4321");
+  define_text("__ORDER_PDP_ENDIAN__ 3412");
+  define_text("__BYTE_ORDER__ __ORDER_LITTLE_ENDIAN__");
+
+  define_text("__SIZEOF_LONG_LONG__ 8");
+  define_text("__SIZEOF_SIZE_T__ 8");
+  define_text("__SIZEOF_PTRDIFF_T__ 8");
+  define_text("__SIZEOF_WCHAR_T__ 4");
+  define_text("__SIZEOF_WINT_T__ 4");
+  define_text("__SIZEOF_FLOAT__ 4");
+  define_text("__SIZEOF_DOUBLE__ 8");
+  define_text("__SIZEOF_LONG_DOUBLE__ 16");
 }
 
 // ---- #define --------------------------------------------------------------

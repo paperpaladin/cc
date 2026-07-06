@@ -866,6 +866,60 @@ shift_matrix
 # without waiting for `make fuzz`. Twenty seeds catches the planted defects
 # measured in the README roughly half the time; the point here is a smoke
 # test, and the volume lives in the other target.
+# Predefined macros, with gcc computing every expected value.
+#
+# A predefine is the easiest thing in a compiler to get silently wrong:
+# nothing fails, the header just takes the other branch. glibc's
+# <bits/wordsize.h> keys on __LP64__ and picks 32-bit type definitions
+# without it, so the first symptom is a struct whose fields are in the
+# wrong places, several translation units away from the cause.
+#
+# So the test does not assert values. It compiles the same program with
+# gcc and with us and compares what the two binaries return. A macro we
+# define with the wrong value fails, and so does one we do not define at
+# all, because the program does not compile without it.
+#
+# Deliberately absent: __SIZEOF_INT128__, __SIZEOF_FLOAT80__ and
+# __SIZEOF_FLOAT128__, which gcc defines and we do not. Defining them
+# would advertise types this compiler refuses, which turns a clean
+# "unknown type name" into a header taking a branch that cannot work.
+predefine_test() {
+	for m in __x86_64__ __amd64 __amd64__ __linux__ __linux __gnu_linux__ \
+	         __unix __unix__ __ELF__ __LP64__ _LP64 __STDC__ __CHAR_BIT__ \
+	         __ORDER_LITTLE_ENDIAN__ __ORDER_BIG_ENDIAN__ \
+	         __ORDER_PDP_ENDIAN__ __BYTE_ORDER__ \
+	         __SIZEOF_LONG_LONG__ __SIZEOF_SIZE_T__ __SIZEOF_PTRDIFF_T__ \
+	         __SIZEOF_WCHAR_T__ __SIZEOF_WINT_T__ __SIZEOF_FLOAT__ \
+	         __SIZEOF_DOUBLE__ __SIZEOF_LONG_DOUBLE__ __SIZEOF_INT__ \
+	         __SIZEOF_LONG__ __SIZEOF_SHORT__ __SIZEOF_POINTER__; do
+		# Modulo 251 so a value too large for an exit status still
+		# distinguishes a wrong one, and prime so the common powers
+		# of two do not collide.
+		printf 'int main(void) { return (%s) %% 251; }' "$m" > "$T.c"
+		if ! gcc -w "$T.c" -o "$T.gccbin" 2> /dev/null; then
+			fail=$((fail + 1))
+			printf 'FAIL  gcc does not define %s, so the case is wrong\n' "$m"
+			continue
+		fi
+		"./$T.gccbin"; want=$?
+		if ! "$CCBIN" "$T.c" -o "$T.bin" 2> "$T.err"; then
+			fail=$((fail + 1))
+			printf 'FAIL  %s is not defined\n' "$m"
+			sed 's/^/        /' "$T.err"
+			continue
+		fi
+		"./$T.bin"; got=$?
+		if [ "$got" = "$want" ]; then
+			pass=$((pass + 1))
+		else
+			fail=$((fail + 1))
+			printf 'FAIL  %s is %s, gcc says %s\n' "$m" "$got" "$want"
+		fi
+	done
+	rm -f "$T.gccbin"
+}
+predefine_test
+
 fuzz_smoke() {
   if CCBIN="$CCBIN" ./t/fuzz.sh 1 20 > "$T.fuzz" 2>&1; then
     pass=$((pass + 1)); printf 'ok    %s\n' "$(tail -1 "$T.fuzz")"
