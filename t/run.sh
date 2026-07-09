@@ -866,6 +866,30 @@ shift_matrix
 # without waiting for `make fuzz`. Twenty seeds catches the planted defects
 # measured in the README roughly half the time; the point here is a smoke
 # test, and the volume lives in the other target.
+# Enum signedness, which C11 6.7.2.2p4 leaves implementation-defined.
+# gcc picks unsigned int when no enumerator is negative and int
+# otherwise, and every value below was taken from gcc before it was
+# written here.
+#
+# It is invisible until a bit-field of enum type stores a value with
+# the top bit of the field set: 150 in an 8-bit field reads back as
+# -106 if the load sign-extends. c-testsuite 00218 is that case, and
+# these are here because the corpus is fetched and skips offline, so a
+# fix with no local test is a fix waiting to be undone.
+#
+# The third case is the one that keeps the rule honest. An enum with a
+# negative enumerator must stay signed, so this is not "make enums
+# unsigned", it is "derive the signedness from the enumerators".
+check 150 'enum e { A = 148, B }; struct s { enum e c : 8; };
+int main(void) { struct s s; s.c = 150; return s.c; }'
+check 1 'enum e { A = 148, B }; int main(void) { return (enum e)-1 > 0; }'
+check 0 'enum e { A = -1, B }; int main(void) { return (enum e)-1 > 0; }'
+check 1 'enum e { A = -1, B = 148 }; struct s { enum e c : 8; };
+int main(void) { struct s s; s.c = 150; return s.c < 0; }'
+check 1 'enum e { A, B }; int main(void) { enum e x = A; return x - 1 > 0; }'
+check 1 'enum e { A = 148, B }; struct s { enum e c : 8; unsigned f : 1; };
+int main(void) { struct s s; s.c = 150; s.f = 1; return s.c == 150 && s.f == 1; }'
+
 # Predefined macros, with gcc computing every expected value.
 #
 # A predefine is the easiest thing in a compiler to get silently wrong:
