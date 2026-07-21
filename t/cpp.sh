@@ -266,6 +266,67 @@ check 'nested include resolves relative to its own file' "$TMP/i3.c" "-I$TMP/inc
 # stops meaning anything the moment the input depends on which compiler is
 # asking, so the question here is only "does it come out whole", and
 # t/run.sh asks the stronger one by compiling and running the result.
+# push_macro and pop_macro, a gcc extension that both gcc and clang
+# implement, so both sides of check() have an opinion here.
+#
+# These are the only two pragmas that change what the preprocessor
+# produces. Ignoring them, which this compiler did until now, is a
+# miscompilation rather than a missing feature: the program still
+# builds, with the wrong macro body. c-testsuite 00206 was exactly
+# that, printing the wrong string twice and exiting 0.
+case_ 'push_macro and pop_macro round trip' '#define X 1
+#pragma push_macro("X")
+#undef X
+#define X 2
+X
+#pragma pop_macro("X")
+X'
+
+# Pushing a macro that is not defined has to record that it was not
+# defined, so the pop undefines rather than doing nothing. A stack that
+# stores only definitions gets this wrong and nothing else notices.
+case_ 'push_macro on an undefined name' '#pragma push_macro("X")
+#define X 7
+X
+#pragma pop_macro("X")
+X'
+
+case_ 'push_macro nests, last in first out' '#define X 1
+#pragma push_macro("X")
+#undef X
+#define X 2
+#pragma push_macro("X")
+#undef X
+#define X 3
+X
+#pragma pop_macro("X")
+X
+#pragma pop_macro("X")
+X'
+
+# gcc ignores a pop with no matching push rather than erroring.
+case_ 'pop_macro with no push is ignored' '#define X 5
+#pragma pop_macro("X")
+X'
+
+case_ 'push_macro keeps a function-like macro' '#define F(a) ((a)+1)
+#pragma push_macro("F")
+#undef F
+#define F(a) ((a)+100)
+F(1)
+#pragma pop_macro("F")
+F(1)'
+
+# A redefinition without an intervening #undef still has to leave the
+# pushed body recoverable, which it does only because undef_macro
+# unlinks without freeing.
+case_ 'push_macro survives a redefinition' '#define X 1
+#pragma push_macro("X")
+#define X 2
+X
+#pragma pop_macro("X")
+X'
+
 real_header() {
   name=$1; body=$2
   printf '%s\n' "$body" > "$TMP/rh.c"

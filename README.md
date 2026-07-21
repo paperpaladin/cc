@@ -487,15 +487,10 @@ which was a confident explanation of something that does not happen.
 
 ```
 $ make conformance
-c-testsuite: 183 of 220 pass (83%)
+c-testsuite: 186 of 220 pass (84%)
   no regressions against t/cts-baseline.txt
   by kind:
        34 refused
-        3 MISCOMPILED-stdout
-  accepted and then wrong, which is the bad kind:
-    00206 MISCOMPILED-stdout
-    00212 MISCOMPILED-stdout
-    00218 MISCOMPILED-stdout
 ```
 
 Every other oracle here compares cc against gcc and clang on programs
@@ -507,9 +502,32 @@ cases nobody here chose.
 The two kinds of failure are never merged into one number. A refusal is
 a gap: cc declined, which is the honest answer to a feature it does not
 have. A miscompilation is a bug: cc accepted the program and produced a
-binary that crashed or printed the wrong thing. Thirty-four of the
-thirty-seven failures are the first kind. Three are the second, and all
-four of the originals were invisible until this ran.
+binary that crashed or printed the wrong thing.
+
+All thirty-four remaining failures are the first kind. There were four
+of the second, all of them invisible until this corpus ran, and all
+four are fixed:
+
+- **00078**, a function declared at block scope. It fell through to
+  the local-variable path, got a stack slot, and the call went through
+  those eight bytes. Six lines, below.
+- **00212**, `__LP64__` not predefined. The one-line fix would have
+  been the wrong size: gcc predefines 400 macros here and cc had 44,
+  so the fix was the 23 platform macros a real program tests, with gcc
+  computing every expected value.
+- **00218**, enum signedness. `new_enum_type` never set `is_unsigned`,
+  so an eight-bit bit-field of enum type read 150 back as -106. C11
+  leaves the compatible type implementation-defined and the rule came
+  from gcc: unsigned when no enumerator is negative.
+- **00206**, `#pragma push_macro` and `pop_macro`. cc skipped every
+  pragma, which is right for the ones that change nothing observable
+  and wrong for these two: the program kept building with the wrong
+  macro body and printed the wrong string twice, exiting 0.
+
+That last one is the clearest case of the distinction this whole
+section is about. Skipping an unknown pragma is what the standard
+asks for. Skipping a known one that changes what the preprocessor
+produces is a miscompilation wearing a shrug.
 
 The smallest of them is six lines:
 
