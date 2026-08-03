@@ -62,7 +62,8 @@ class Gen:
         self.vars = []      # unsigned long, the accumulator type
         self.narrow = []    # (name, ctype) for the promotion cases
         self.arrays = []    # (name, length)
-        self.structs = []   # names of struct P values
+        self.structs = []
+        self.enums = []    # names of enum-bit-field struct values
         self.lines = []
 
     # ---- expressions ------------------------------------------------------
@@ -194,6 +195,87 @@ class Gen:
         s = self.r.choice(self.structs)
         return "fold(%s)" % s
 
+    def decl_enum_bitfield(self):
+        """An enum-typed bit-field, which is where enum signedness becomes
+        observable at all.
+
+        C11 6.7.2.2p4 leaves the compatible type of an enum
+        implementation-defined. gcc and clang both choose unsigned when
+        no enumerator is negative, so a value with the top bit of the
+        field set reads back positive; choose signed and it reads back
+        negative. Nothing else in a program can see the difference,
+        which is why this was a real miscompilation here and why no
+        amount of ordinary expression fuzzing would have found it.
+
+        Both enums are emitted: one all-positive, one with a negative
+        member, because the rule is "derive the signedness from the
+        enumerators" and a generator that only ever produced the first
+        would pass against a compiler that simply made every enum
+        unsigned."""
+        name = "e%d" % len(self.enums)
+        which = self.r.choice(("Epos", "Eneg"))
+        val = self.r.choice((
+            "SOME_POS", "SOME_POS + 1", "148", "150", "200", "255",
+        )) if which == "Epos" else self.r.choice((
+            "SOME_NEG", "SOME_NEG + 1", "0", "1", "60",
+        ))
+        self.lines.append("  struct B%s %s; %s.f = (%s);" %
+                          (which[1:], name, name, val))
+        self.enums.append(name)
+        # Read back through the bit-field, which is the half that
+        # matters: the store is easy and the load is where the sign
+        # extension happens.
+        self.observe("(unsigned long)(long)%s.f" % name)
+
+    def enum_expr(self):
+        e = self.r.choice(self.enums)
+        return "(unsigned long)(long)%s.f" % e
+
+    def switch_stmt(self, depth):
+        """A switch, including fallthrough and a default.
+
+        Nothing else here produces a jump table or a chain of
+        comparisons, and the two are different code paths in most
+        compilers. The selector is masked to a small range so the
+        cases are reachable rather than decorative."""
+        if not self.vars:
+            self.decl()
+        sel = "(int)((%s) %% 4UL)" % self.r.choice(self.vars)
+        tgt = self.r.choice(self.vars)
+        self.lines.append("  switch (%s) {" % sel)
+        self.lines.append("  case 0:")
+        self.lines.append("    %s = %s;" % (tgt, self.expr(2)))
+        if self.r.random() < 0.5:
+            self.lines.append("    /* falls through */")
+        else:
+            self.lines.append("    break;")
+        self.lines.append("  case 1:")
+        self.lines.append("  case 2:")
+        self.lines.append("    %s = %s;" % (tgt, self.expr(2)))
+        self.lines.append("    break;")
+        self.lines.append("  default:")
+        self.lines.append("    %s = %s;" % (tgt, self.expr(2)))
+        self.lines.append("    break;")
+        self.lines.append("  }")
+        self.observe(tgt)
+
+    def compound_assign(self):
+        """Compound assignment and the increment operators.
+
+        `x += e` is not `x = x + e` in the abstract machine (the operand
+        is evaluated once) and it is not the same code either. All of
+        these are on unsigned long, where every operation is defined and
+        overflow wraps."""
+        if not self.vars:
+            self.decl()
+        v = self.r.choice(self.vars)
+        op = self.r.choice(("+=", "-=", "*=", "^=", "|=", "&="))
+        self.lines.append("  %s %s (%s);" % (v, op, self.expr(2)))
+        if self.r.random() < 0.5:
+            form = self.r.choice(("%s++", "++%s", "%s--", "--%s"))
+            self.observe(form % v)
+        self.observe(v)
+
     def assign(self):
         if not self.vars:
             return self.decl()
@@ -204,12 +286,14 @@ class Gen:
         are dropped from the live set afterwards -- otherwise the final fold
         references names that no longer exist, and every compiler rejects
         the program rather than disagreeing about it."""
-        marks = (len(self.vars), len(self.narrow), len(self.arrays), len(self.structs))
+        marks = (len(self.vars), len(self.narrow), len(self.arrays),
+                 len(self.structs), len(self.enums))
         self.block(depth)
         del self.vars[marks[0]:]
         del self.narrow[marks[1]:]
         del self.arrays[marks[2]:]
         del self.structs[marks[3]:]
+        del self.enums[marks[4]:]
 
     def if_stmt(self, depth):
         self.lines.append("  if (%s) {" % self.cond(2))
@@ -265,19 +349,35 @@ class Gen:
                 self.decl_narrow()
             elif k < 0.60:
                 self.decl_array()
-            elif k < 0.66:
+            elif k < 0.58:
                 self.decl_struct()
-            elif k < 0.78 and depth > 0:
+            elif k < 0.66:
+                self.decl_enum_bitfield()
+            elif k < 0.74:
+                self.compound_assign()
+            elif k < 0.80 and depth > 0:
                 self.if_stmt(depth)
-            elif k < 0.86 and depth > 0:
+            elif k < 0.85 and depth > 0:
                 self.loop(depth)
-            elif k < 0.94 and self.narrow:
+            elif k < 0.92 and depth > 0:
+                self.switch_stmt(depth)
+            elif k < 0.96 and self.narrow:
                 self.widen_call()
             else:
                 self.call()
 
     def program(self):
         self.lines.append("struct P { unsigned long a, b; };")
+        # Two enums and two bit-fields of enum type. Epos has no
+        # negative enumerator so its compatible type is unsigned, and a
+        # value with bit 7 set reads back positive; Eneg has one, so it
+        # is signed and the same bit pattern reads back negative. That
+        # difference is the only way an enum's signedness is observable,
+        # and getting it wrong was a real miscompilation here.
+        self.lines.append("enum Epos { SOME_POS = 148, NEXT_POS };")
+        self.lines.append("enum Eneg { SOME_NEG = -1, NEXT_NEG = 148 };")
+        self.lines.append("struct Bpos { enum Epos f : 8; unsigned g : 1; };")
+        self.lines.append("struct Bneg { enum Eneg f : 8; unsigned g : 1; };")
         self.lines.append("unsigned long mix(unsigned long a, unsigned long b) {")
         self.lines.append("  return (a * 3UL) ^ (b + 7UL) ^ (a >> 3UL);")
         self.lines.append("}")
@@ -303,7 +403,13 @@ class Gen:
         self.lines.append("}")
         self.lines.append("int main(void) {")
         self.lines.append("  unsigned long acc = 0UL;")
-        self.block(3)
+        # Several top-level blocks rather than one. With a single block
+        # of one to four statements, a construct chosen 8% of the time
+        # appeared in about one program in thirty, which is not fuzzing
+        # it, it is occasionally mentioning it. The census in t/fuzz.sh
+        # is what says whether this is enough.
+        for _ in range(self.r.randint(3, 6)):
+            self.block(3)
         total = " ^ ".join(self.vars) if self.vars else "0UL"
         self.lines.append("  unsigned long result = acc ^ (%s);" % total)
         # 251 is prime, so a wrong answer is unlikely to agree in the low

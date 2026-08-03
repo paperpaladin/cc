@@ -24,9 +24,30 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 agree=0; disagree=0; skipped=0
+
+# A census of what the generator actually emitted, counted from the
+# sources themselves rather than from what the generator is believed to
+# emit. "0 disagree" over a range that never produced a switch is not
+# evidence about switch, and the only way to tell those apart is to
+# count. The floors below are asserted at the end: a construct that
+# stops being generated, because a probability was retuned or a branch
+# became unreachable, turns this red instead of quietly shrinking what
+# is being fuzzed.
+#
+# This was prompted by widening the generator and finding the new
+# constructs appeared in one program in thirty. The fuzzer reported
+# 300 agree either way.
+c_enum=0; c_switch=0; c_compound=0; c_struct=0; c_narrow=0; c_loop=0
 seed=$FIRST
 while [ "$seed" -le "$LAST" ]; do
   python3 t/gen.py "$seed" > "$TMP/p.c"
+
+  grep -qE '\.f = ' "$TMP/p.c"      && c_enum=$((c_enum + 1))
+  grep -qE 'switch \(' "$TMP/p.c"   && c_switch=$((c_switch + 1))
+  grep -qE '(\+=|-=|\*=|\^=|\|=|&=) \(' "$TMP/p.c" && c_compound=$((c_compound + 1))
+  grep -qE 'fold\(' "$TMP/p.c"      && c_struct=$((c_struct + 1))
+  grep -qE 'narrow\(' "$TMP/p.c"    && c_narrow=$((c_narrow + 1))
+  grep -qE 'for \(int ' "$TMP/p.c"  && c_loop=$((c_loop + 1))
 
   if ! gcc -w "$TMP/p.c" -o "$TMP/gcc.bin" 2>/dev/null; then
     skipped=$((skipped + 1)); seed=$((seed + 1)); continue
@@ -95,4 +116,29 @@ if [ "$agree" -eq 0 ]; then
     "$skipped" "$((LAST - FIRST + 1))"
   exit 1
 fi
+printf 'reached: %s enum bit-field, %s switch, %s compound assign, %s struct by value, %s narrow call, %s loop (of %s seeds)\n' \
+  "$c_enum" "$c_switch" "$c_compound" "$c_struct" "$c_narrow" "$c_loop" \
+  "$((LAST - FIRST + 1))"
+
+# Floors, not targets. Each is well under what the generator produces
+# today, so this fires when a construct stops being generated at all
+# rather than on ordinary variation. A range too short to clear them
+# is not a failure of the compiler and says so.
+span=$((LAST - FIRST + 1))
+if [ "$span" -ge 40 ]; then
+  short=""
+  [ "$c_enum" -lt 5 ]     && short="$short enum-bitfield($c_enum)"
+  [ "$c_switch" -lt 5 ]   && short="$short switch($c_switch)"
+  [ "$c_compound" -lt 5 ] && short="$short compound-assign($c_compound)"
+  [ "$c_struct" -lt 5 ]   && short="$short struct-by-value($c_struct)"
+  [ "$c_narrow" -lt 5 ]   && short="$short narrow-call($c_narrow)"
+  [ "$c_loop" -lt 5 ]     && short="$short loop($c_loop)"
+  if [ -n "$short" ]; then
+    printf 'FAIL  the generator stopped emitting:%s\n' "$short"
+    printf '      agreement over a range that never generated a construct is\n'
+    printf '      not evidence about that construct.\n'
+    exit 1
+  fi
+fi
+
 [ "$disagree" -eq 0 ]

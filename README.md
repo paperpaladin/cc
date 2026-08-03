@@ -332,12 +332,17 @@ With that case in, the mutant dies.
 ### Random programs, judged by two compilers
 
 ```
-$ make fuzz FROM=2000 TO=2600
-601 agree, 0 disagree, 0 skipped (seeds 2000..2600)
+$ make fuzz FROM=1 TO=200
+200 agree, 0 disagree, 0 skipped (seeds 1..200)
+reached: 116 enum bit-field, 122 switch, 136 compound assign, 200 struct by value, 200 narrow call, 100 loop (of 200 seeds)
 ```
 
-About 1,360 distinct seeds have been run across several ranges, with no
-disagreement.
+That second line is the point of the first. 400 seeds agreeing is
+either evidence the compiler is right or evidence the generator is
+narrow, and the number alone does not say which. It was the second:
+until recently the generator emitted no enums, no `switch`, no
+compound assignment and no increment operators, so agreement about
+those constructs was agreement about nothing.
 
 `t/gen.py` writes a random C program. gcc and clang say what it should
 return. The generator being ours costs nothing, because **the generator is
@@ -357,6 +362,24 @@ If gcc and clang disagree with **each other**, the generator let undefined
 behaviour through. Those seeds are skipped and counted, because a silently
 shrinking denominator is how a fuzzer stops meaning anything.
 
+The census is the same idea one level up. A construct that stops being
+generated shrinks what is being fuzzed without shrinking any number
+the fuzzer prints, so the constructs are counted from the generated
+sources and each has a floor. Disabling the enum branch does not
+produce "60 agree"; it produces a refusal to report at all.
+
+Tuning them was a measurement too. At the first attempt the four new
+constructs appeared in about one program in thirty, and the fuzzer
+reported 300 agree either way. The frequencies and the number of
+top-level blocks were raised until the census said they were actually
+being reached.
+
+The last row of the table below is the one that justifies the work:
+enum signedness is only observable through a bit-field of enum type,
+it was a real miscompilation here a day ago, and the generator that
+ran 400 clean seeds could not have found it, because it never wrote
+the word `enum`.
+
 And because a fuzzer that always passes is worth nothing, it was checked
 against planted defects, not assumed to work:
 
@@ -369,6 +392,7 @@ against planted defects, not assumed to work:
 | a signed `char` loaded with `movzbl` | 11 of 100 |
 | shift count taken from the wrong place | 13 of 100 |
 | an argument not converted at the call | 5 of 100 |
+| enum signedness not derived from the enumerators | 17 of 60 |
 
 Three of those numbers started at zero, and fixing them is most of what
 this generator is:
