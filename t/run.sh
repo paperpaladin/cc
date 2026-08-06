@@ -892,6 +892,22 @@ int main(void) { struct s s; s.c = 150; s.f = 1; return s.c == 150 && s.f == 1; 
 
 # Predefined macros, with gcc computing every expected value.
 #
+# --- tentative definitions (PLAN 20)
+# c-testsuite 00095, 00096 and 00136 all failed on this, and all three
+# failed the same way: cc accepted the program, emitted a label per
+# declaration, and gas said "symbol `x' is already defined". The corpus
+# runner scored that as a refusal because cc exited non-zero, which is
+# the one thing it must not be confused with.
+check 3 'int x1; int x1 = 3; int x1; int main(){ return x1; }'
+check 3 'int x2, x2 = 3, x2; int main(){ return x2; }'
+check 7 'extern int y1; int y1 = 7; int main(){ return y1; }'
+check 5 'int y2 = 5; extern int y2; int main(){ return y2; }'
+check 9 'int y3; int main(){ y3 = 9; return y3; } int y3;'
+check 4 'static int y4; static int y4 = 4; int main(){ return y4; }'
+check 6 'int a1[2]; int a1[2] = {6, 1}; int main(){ return a1[0]; }'
+refuse 'int d1 = 1; int d1 = 2; int main(){ return d1; }'
+refuse 'int d2; char d2; int main(){ return 0; }'
+
 # A predefine is the easiest thing in a compiler to get silently wrong:
 # nothing fails, the header just takes the other branch. glibc's
 # <bits/wordsize.h> keys on __LP64__ and picks 32-bit type definitions

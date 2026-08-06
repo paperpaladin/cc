@@ -2647,8 +2647,40 @@ static void global_variable(Type *base, VarAttr *attr) {
     // would create a second definition at link time.
     if (!(attr && attr->is_extern) && ty->size < 0)
       error_at(tk->loc, "global has incomplete type");
-    Obj *v = new_var(name, ty, false);
-    if (attr) { v->is_static = attr->is_static; v->is_extern = attr->is_extern; }
+
+    // C11 6.9.2p2: "int x;" at file scope is a TENTATIVE definition, and
+    // however many of them a translation unit holds, they all name one
+    // object. A second Obj gave the output a second label for the same
+    // name, and gas rejects that outright: "symbol `x' is already
+    // defined". The whole file then failed to assemble and cc exited
+    // non-zero, which from outside is indistinguishable from a refusal
+    // while being nothing of the kind -- cc had diagnosed nothing and
+    // emitted assembly it could not assemble.
+    Obj *v = NULL;
+    if (name)
+      for (VarScope *vs = scope->vars; vs; vs = vs->next)
+        if (vs->var && !vs->var->is_function && !strcmp(vs->var->name, name)) {
+          v = vs->var;
+          break;
+        }
+
+    if (v) {
+      if (v->ty->kind != ty->kind || v->ty->size != ty->size)
+        error_at(tk->loc, "'%s' redeclared with a different type", name);
+      // Two initialisers is two definitions, which is an error rather than
+      // a tentative definition, so it has to be caught here: taking the
+      // second one silently would compile a program gcc rejects.
+      if (v->init_data && peek("="))
+        error_at(tk->loc, "'%s' is defined twice", name);
+      if (attr && attr->is_static) v->is_static = true;
+      // An extern declaration is a promise someone else defines it, and a
+      // tentative definition beside it withdraws the promise. The reverse
+      // order says nothing: a definition already seen stays a definition.
+      if (!(attr && attr->is_extern)) v->is_extern = false;
+    } else {
+      v = new_var(name, ty, false);
+      if (attr) { v->is_static = attr->is_static; v->is_extern = attr->is_extern; }
+    }
 
     if (consume("=")) {
       // C11 6.9.2: a file-scope declaration with an initialiser IS a
