@@ -64,6 +64,26 @@ check() {
 # Pull in just the case lines. Sourcing run.sh wholesale would redefine check()
 # back to its own version and silently defeat the whole point of this file.
 grep '^check ' t/run.sh > t/cases.sh
+
+# A case written as `check` but spanning two lines leaves an unterminated
+# quote in the extract, which swallows the next line and then breaks the
+# parse. Sourcing a file that does not parse ends this script where it
+# stands, so the output is one "Syntax error" line and exit 2 with no hint
+# that the oracle has lost its subject. That is what happened: three enum
+# bitfield cases were added across two lines each, and `make diff-test`
+# had not compared anything since. Checking the extract before sourcing it
+# is four lines and names the cause.
+if ! sh -n t/cases.sh 2>t/dt.synerr; then
+	printf 'differential: the extracted cases do not parse.\n' >&2
+	sed 's/^/  /' t/dt.synerr >&2
+	printf '  A multi-line case must be written as check_src, or joined\n' >&2
+	printf '  onto one line. These are the unbalanced ones:\n' >&2
+	awk '/^check /{ n = gsub(/\x27/, "\x27"); if (n % 2 == 1) print "  " FILENAME ":" NR }' \
+		t/run.sh >&2
+	rm -f t/cases.sh t/dt.synerr
+	exit 1
+fi
+rm -f t/dt.synerr
 . ./t/cases.sh
 rm -f t/cases.sh
 

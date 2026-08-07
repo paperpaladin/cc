@@ -237,7 +237,6 @@ check 98 'int main() { char *s = "abc"; return s[1]; }'
 check 0  'int main() { char *s = "abc"; return s[3]; }'
 check 4  'int main() { return sizeof("abc"); }'
 check 9  'int main() { char *s = "\t"; return s[0]; }'
-
 # --- calling into libc (exercises the ABI against real code)
 check 0  'int main() { printf("libc works: %d\n", 42); return 0; }'
 check 5  'int main() { return strlen("hello"); }'
@@ -880,15 +879,12 @@ shift_matrix
 # The third case is the one that keeps the rule honest. An enum with a
 # negative enumerator must stay signed, so this is not "make enums
 # unsigned", it is "derive the signedness from the enumerators".
-check 150 'enum e { A = 148, B }; struct s { enum e c : 8; };
-int main(void) { struct s s; s.c = 150; return s.c; }'
+check 150 'enum e { A = 148, B }; struct s { enum e c : 8; }; int main(void) { struct s s; s.c = 150; return s.c; }'
 check 1 'enum e { A = 148, B }; int main(void) { return (enum e)-1 > 0; }'
 check 0 'enum e { A = -1, B }; int main(void) { return (enum e)-1 > 0; }'
-check 1 'enum e { A = -1, B = 148 }; struct s { enum e c : 8; };
-int main(void) { struct s s; s.c = 150; return s.c < 0; }'
+check 1 'enum e { A = -1, B = 148 }; struct s { enum e c : 8; }; int main(void) { struct s s; s.c = 150; return s.c < 0; }'
 check 1 'enum e { A, B }; int main(void) { enum e x = A; return x - 1 > 0; }'
-check 1 'enum e { A = 148, B }; struct s { enum e c : 8; unsigned f : 1; };
-int main(void) { struct s s; s.c = 150; s.f = 1; return s.c == 150 && s.f == 1; }'
+check 1 'enum e { A = 148, B }; struct s { enum e c : 8; unsigned f : 1; }; int main(void) { struct s s; s.c = 150; s.f = 1; return s.c == 150 && s.f == 1; }'
 
 # Predefined macros, with gcc computing every expected value.
 #
@@ -969,6 +965,7 @@ fuzz_smoke() {
   fi
   rm -f "$T.fuzz"
 }
+
 fuzz_smoke
 
 # The two divergences that prompted the sweep, kept as named cases so a
