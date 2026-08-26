@@ -237,6 +237,26 @@ check 98 'int main() { char *s = "abc"; return s[1]; }'
 check 0  'int main() { char *s = "abc"; return s[3]; }'
 check 4  'int main() { return sizeof("abc"); }'
 check 9  'int main() { char *s = "\t"; return s[0]; }'
+
+# --- prefixed character constants (PLAN 20)
+# c-testsuite 00098 is one line of this and glibc needs it too: <bits/wchar.h>
+# settles WCHAR_MAX with "#elif L'\0' - 1 > 0", so without it <wchar.h>
+# fails with "undefined identifier 'L'" pointing into a system header.
+# Double quotes, not single, because the source itself contains ' and
+# t/differential.sh pulls these lines out one at a time.
+check 65  "int main(){ return L'A'; }"
+check 0   "int main(){ return L'\0'; }"
+check 0   "int main(){ return L'\0' - 1 > 0; }"
+check 65  "int main(){ return u'A'; }"
+check 65  "int main(){ return U'A'; }"
+check 4   "int main(){ return sizeof(L'A'); }"
+# wchar_t is a 32-bit int, so this does NOT truncate the way a plain 'x'
+# does. Returning the value alone cannot see the difference, since the exit
+# status takes the low byte either way: L'\xc8' is 200 and (char)0xc8 is -56,
+# and both exit 200. The comparison is what makes the sign observable.
+check 1   "int main(){ return L'\xc8' > 0; }"
+check 200 "int main(){ return L'\xc8'; }"
+
 # --- calling into libc (exercises the ABI against real code)
 check 0  'int main() { printf("libc works: %d\n", 42); return 0; }'
 check 5  'int main() { return strlen("hello"); }'
@@ -965,6 +985,11 @@ fuzz_smoke() {
   fi
   rm -f "$T.fuzz"
 }
+# A wide character constant holding more than one byte. Built with printf
+# rather than written as a literal, so this file stays ASCII. Reading the
+# first byte of a UTF-8 sequence would put a number in the token that gcc
+# does not agree with, and a wrong answer is worse than a refusal.
+unimpl "int main(){ return L'$(printf '\344\275\240')' == 0; }"
 
 fuzz_smoke
 

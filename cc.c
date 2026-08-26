@@ -327,6 +327,30 @@ static Token *tokenize(File *file) {
       continue;
     }
 
+    // A prefixed character constant. L'x' has type wchar_t, u'x' char16_t,
+    // U'x' char32_t, and none of the three truncate to a signed char the way
+    // a plain 'x' does. One of them is not optional: glibc settles WCHAR_MAX
+    // in <bits/wchar.h> with "#elif L'\0' - 1 > 0", so a tokenizer that
+    // cannot lex L'\0' cannot read <wchar.h> at all, and the symptom is an
+    // undefined identifier 'L' pointing into a system header.
+    if ((*p == 'L' || *p == 'u' || *p == 'U') && p[1] == '\'') {
+      char *start = p;
+      p += 2;
+      if (!*p) error_at(start, "unterminated char literal");
+      // One byte of a UTF-8 sequence is not the character the source wrote.
+      // Reading it anyway would put a number in the token that gcc does not
+      // agree with, which is worse than refusing: the whole argument here is
+      // that a missing feature must never become a wrong answer.
+      if ((unsigned char)*p >= 0x80)
+        error_at(start, "a multibyte wide character constant is not implemented");
+      int c = read_char(&p);
+      if (*p != '\'') error_at(start, "unterminated char literal");
+      p++;
+      cur = cur->next = new_token(TK_NUM, start, p);
+      cur->val = c;    // wchar_t is a 32-bit int here, so nothing truncates
+      continue;
+    }
+
     if (*p == '\'') {
       char *start = p++;
       if (!*p) error_at(start, "unterminated char literal");
