@@ -1492,28 +1492,64 @@ static void zero_walk(Node *base, Type *ty, Node **cur, Token *tok) {
   *cur = (*cur)->next = as_stmt(base, new_num(0, tok), tok);
 }
 
-// Counts top-level elements of a brace initialiser without consuming it, so an
-// unsized array can learn its own length.
+// The length of a brace initialiser, measured without consuming it, so an
+// unsized array can learn its own.
+//
+// Counting commas was enough until designators arrived and is not any more.
+// "[3] = v" PLACES an element rather than appending one, and the elements
+// after it continue from there, so the length is the highest index reached:
+// "int a[] = {5, [2] = 2, 3}" is four elements and has two commas. This
+// used to return 3 for it, and an array one element short of its own
+// initialiser is a wrong answer rather than a refusal.
 static int count_init_elems(void) {
   Token *save = tk;
   if (!peek("{")) error_at(tk->loc, "expected an initialiser list");
   tk = tk->next;
+  if (peek("}")) { tk = save; return 0; }
 
-  bool empty = peek("}");
-  int depth = 0, commas = 0;
-  Token *prev = NULL;
-  while (!(depth == 0 && peek("}"))) {
+  int idx = 0, len = 0;
+  while (!peek("}")) {
     if (tk->kind == TK_EOF) error_at(save->loc, "unterminated initialiser");
-    if (tok_is(tk, "{")) depth++;
-    else if (tok_is(tk, "}")) depth--;
-    else if (depth == 0 && tok_is(tk, ",")) commas++;
-    prev = tk;
+    if (consume("[")) { idx = (int)const_expr(); expect("]"); expect("="); }
+    // Step over this element's value, whatever shape it has. Brackets and
+    // parentheses count towards the nesting as well as braces: "a[1]" and
+    // "f(x, y)" both appear in real initialisers, and the comma inside the
+    // second one does not separate elements.
+    int depth = 0;
+    while (!(depth == 0 && (peek(",") || peek("}")))) {
+      if (tk->kind == TK_EOF) error_at(save->loc, "unterminated initialiser");
+      if (tok_is(tk, "{") || tok_is(tk, "(") || tok_is(tk, "[")) depth++;
+      else if (tok_is(tk, "}") || tok_is(tk, ")") || tok_is(tk, "]")) depth--;
+      tk = tk->next;
+    }
+    idx++;
+    if (idx > len) len = idx;
+    if (!consume(",")) break;      // a trailing comma adds no element
+  }
+  tk = save;
+  return len;
+}
+
+// Does the brace list at the cursor hold a designator at its top level?
+// Asked before anything is consumed, because the answer decides whether the
+// object is zeroed before the list is walked or after it.
+static bool list_has_designator(void) {
+  Token *save = tk;
+  if (!peek("{")) return false;
+  tk = tk->next;
+  bool found = false;
+  int depth = 0;
+  bool at_elem = true;        // the next token begins an element
+  while (!(depth == 0 && peek("}")) && tk->kind != TK_EOF) {
+    if (at_elem && (tok_is(tk, "[") || tok_is(tk, "."))) { found = true; break; }
+    at_elem = false;
+    if (tok_is(tk, "{") || tok_is(tk, "(") || tok_is(tk, "[")) depth++;
+    else if (tok_is(tk, "}") || tok_is(tk, ")") || tok_is(tk, "]")) depth--;
+    else if (depth == 0 && tok_is(tk, ",")) at_elem = true;
     tk = tk->next;
   }
   tk = save;
-  if (empty) return 0;
-  // A trailing comma is legal and does not introduce an element.
-  return (prev && tok_is(prev, ",")) ? commas : commas + 1;
+  return found;
 }
 
 // Emits the statements that initialise the lvalue `base` of type `ty`.
@@ -1530,20 +1566,32 @@ static void init_walk(Node *base, Type *ty, Node **cur, Token *tok) {
   }
 
   if (ty->kind == TY_ARRAY) {
+    // Asked before the brace is consumed: the helper starts at "{".
+    bool desig = list_has_designator();
     expect("{");
+    // "zero the tail afterwards" cannot survive a designator. A list that
+    // writes [2] and then goes back to [0] would be followed by a fill from
+    // the cursor to the end, which re-zeroes the element the designator had
+    // just set. So when the list holds one, the whole object is zeroed up
+    // front and nothing is zeroed after. The common path keeps the tail fill
+    // and the single store it costs.
+    if (desig) zero_walk(base, ty, cur, tok);
     int i = 0;
     bool first = true;
     while (!peek("}")) {
       if (!first) expect(",");
       first = false;
       if (peek("}")) break;                       // trailing comma
-      if (i >= ty->array_len) error_at(tk->loc, "too many initialisers for this array");
+      if (consume("[")) { i = (int)const_expr(); expect("]"); expect("="); }
+      if (i < 0 || i >= ty->array_len)
+        error_at(tk->loc, "initialiser index is outside this array");
       init_walk(elem_of(base, i, tok), ty->base, cur, tok);
       i++;
     }
     expect("}");
-    for (; i < ty->array_len; i++)
-      zero_walk(elem_of(base, i, tok), ty->base, cur, tok);
+    if (!desig)
+      for (; i < ty->array_len; i++)
+        zero_walk(elem_of(base, i, tok), ty->base, cur, tok);
     return;
   }
 
@@ -1560,23 +1608,35 @@ static void init_walk(Node *base, Type *ty, Node **cur, Token *tok) {
       *cur = (*cur)->next = as_stmt(base, rhs, tok);
       return;
     }
+    // Same reasoning as the array branch: a named member can be set before
+    // an earlier one, so the trailing zero fill would undo it. Asked before
+    // the brace is consumed, since the helper starts at "{".
+    bool desig = list_has_designator();
     expect("{");
+    if (desig) zero_walk(base, ty, cur, tok);
     Member *m = ty->members;
     bool first = true;
     while (!peek("}")) {
       if (!first) expect(",");
       first = false;
       if (peek("}")) break;
+      if (consume(".")) {
+        if (tk->kind != TK_IDENT) error_at(tk->loc, "expected a member name after '.'");
+        m = get_member(ty, tk);
+        tk = tk->next;
+        expect("=");
+      }
       if (!m) error_at(tk->loc, "too many initialisers for this struct");
       init_walk(member_of(base, m, tok), m->ty, cur, tok);
       m = m->next;
-      if (ty->kind == TY_UNION) break;            // only the first member
+      if (ty->kind == TY_UNION && !desig) break;  // only the first member
     }
     expect("}");
-    for (; m; m = m->next) {
-      zero_walk(member_of(base, m, tok), m->ty, cur, tok);
-      if (ty->kind == TY_UNION) break;
-    }
+    if (!desig)
+      for (; m; m = m->next) {
+        zero_walk(member_of(base, m, tok), m->ty, cur, tok);
+        if (ty->kind == TY_UNION) break;
+      }
     return;
   }
 
@@ -1637,10 +1697,21 @@ static void global_init(char *buf, Relocation **rel, Type *ty, int offset) {
       return;
     }
     expect("{");
-    for (int i = 0; i < ty->array_len; i++) {
-      if (i > 0 && !consume(",")) break;
+    // An index designator places the element: "{5, [2] = 2, 3}" fills 0, 2
+    // and 3 and leaves 1 holding the zero the buffer came with. Nothing has
+    // to be undone here, unlike the local path, because a static object is
+    // a byte pattern that starts out zero.
+    int i = 0;
+    bool first = true;
+    while (!peek("}")) {
+      if (!first && !consume(",")) break;
       if (peek("}")) break;
+      first = false;
+      if (consume("[")) { i = (int)const_expr(); expect("]"); expect("="); }
+      if (i < 0 || i >= ty->array_len)
+        error_at(tk->loc, "initialiser index is outside this array");
       global_init(buf, rel, ty->base, offset + i * ty->base->size);
+      i++;
     }
     consume(",");
     expect("}");

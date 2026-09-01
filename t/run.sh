@@ -924,6 +924,39 @@ check 6 'int a1[2]; int a1[2] = {6, 1}; int main(){ return a1[0]; }'
 refuse 'int d1 = 1; int d1 = 2; int main(){ return d1; }'
 refuse 'int d2; char d2; int main(){ return 0; }'
 
+# --- designated initialisers (PLAN 20)
+# Five c-testsuite cases (00092, 00147, 00148, 00150, 00151) needed only the
+# static half of this, because all five designate a file-scope array. The
+# local half is here because it is the same gap, and the differential oracle
+# earned its place on it: the first version of the local path agreed with
+# gcc on every corpus case and was wrong on five of the cases below, because
+# it asked whether the list held a designator AFTER consuming the brace the
+# question starts at, and so always answered no.
+check 4   'int a[] = {5, [2] = 2, 3}; int main(){ return sizeof(a)/sizeof(a[0]); }'
+check 5   'int a[] = {5, [2] = 2, 3}; int main(){ return a[0]+a[1]; }'
+check 23  'int a[] = {5, [2] = 2, 3}; int main(){ return a[2]*10+a[3]; }'
+check 12  'int b[3] = {[2] = 2, [0] = 0, [1] = 1}; int main(){ return b[0]*100+b[1]*10+b[2]; }'
+check 210 'struct S { int a, b; }; struct S r[2] = {[1] = {3, 4}, [0] = {1, 2}}; int main(){ return r[0].a*1000+r[0].b*100+r[1].a*10+r[1].b; }'
+check 90  'struct P { int x, y; }; struct P g = {.y = 9}; int main(){ return g.y*10+g.x; }'
+check 12  'int main(){ int a[3] = {[2] = 2, [0] = 0, [1] = 1}; return a[0]*100+a[1]*10+a[2]; }'
+check 50  'int main(){ int a[4] = {5, [2] = 2, 3}; return a[0]*10+a[1]; }'
+# The ordering case. {[3] = 7, [1] = 1} leaves the cursor at 2, so filling
+# the tail afterwards would re-zero the 7 that is already at index 3. Two
+# cases, because one of them has to look at an index the designators skipped.
+check 70  'int main(){ int a[4] = {[3] = 7, [1] = 1}; return a[3]*10+a[2]; }'
+check 10  'int main(){ int a[4] = {[3] = 7, [1] = 1}; return a[1]*10+a[0]; }'
+check 34  'struct P { int x, y; }; int main(){ struct P p = {.y = 4, .x = 3}; return p.x*10+p.y; }'
+check 40  'struct P { int x, y; }; int main(){ struct P p = {.y = 4}; return p.y*10+p.x; }'
+check 7   'union U { int a; int b; }; int main(){ union U u = {.b = 7}; return u.a; }'
+check 30  'int main(){ int a[2][2] = {[1] = {3, 4}}; return a[1][0]*10+a[0][1]; }'
+# Nothing above can see a regression in the undesignated path, which now
+# takes a different branch, so these two are here to watch it.
+check 123 'int main(){ int a[3] = {1, 2, 3}; return a[0]*100+a[1]*10+a[2]; }'
+check 100 'int main(){ int a[3] = {1}; return a[0]*100+a[1]*10+a[2]; }'
+refuse 'int a[2] = {[5] = 1}; int main(){ return a[0]; }'
+refuse 'int main(){ int a[2] = {[5] = 1}; return a[0]; }'
+refuse 'struct P { int x; }; int main(){ struct P p = {.nope = 1}; return p.x; }'
+
 # A predefine is the easiest thing in a compiler to get silently wrong:
 # nothing fails, the header just takes the other branch. glibc's
 # <bits/wordsize.h> keys on __LP64__ and picks 32-bit type definitions
