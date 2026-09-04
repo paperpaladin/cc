@@ -9,3 +9,5 @@ t/dt.*
 t/cases.sh
 t/ref.bin
 scratch/
+/cc-overread
+t/overread.*

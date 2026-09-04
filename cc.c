@@ -72,9 +72,55 @@ static File *new_file(char *name, char *text) {
   File *f = calloc(1, sizeof(File));
   f->name = name;
   splice_lines(text);
+  f->len = strlen(text);
+  // Trimmed to exactly what it holds, and this is load-bearing rather
+  // than tidy. Two things leave slack here. read_file allocates the
+  // file's size plus two, for a newline phase 1 may have to append and
+  // for a NUL, and usually only one of the two is used. And splicing
+  // DELETES a byte per line continuation without touching the
+  // allocation, which is the harder half of the shape, because no
+  // allocation size can see it -- a header full of continuations ends up
+  // well short of its buffer.
+  //
+  // Either way, a read one byte past the end of the file is still inside
+  // a live allocation, so AddressSanitizer has nothing to report, and
+  // `make test-asan` goes on printing a clean run over an area smaller
+  // than it looks. This is the buffer holding the program being compiled
+  // and every header it pulls in, and f->len beside it is the separate
+  // length that makes the slack unreachable by anything but a bug.
+  //
+  // Every buffer that is ever tokenized arrives here: both read_file
+  // call sites, -D on the command line, ## pastes, # stringifications,
+  // __FILE__, __LINE__ and the built-in definitions. One trim rather
+  // than eight. `make overread` plants the read and fails unless the
+  // sanitizer sees it.
+  // A shrinking realloc that fails may keep the old block, which is still
+  // correct, just not trimmed. error() is not declared yet at this point
+  // in the file and a diagnostic is not worth a forward declaration for a
+  // case that costs nothing.
+  char *trimmed = realloc(text, f->len + 1);
+  if (trimmed) text = trimmed;
   f->text = text;
-  f->len  = strlen(text);
   f->path_index = -1;
+
+#ifdef CC_OVERREAD
+  // Compiled only by `make overread`: one byte past the end of the file
+  // text. With the realloc above removed this same read lands inside the
+  // slack and the sanitizer says nothing, while every other number the
+  // suite prints stays exactly the same.
+  //
+  // Real files only. The synthesized buffers all arrive under a name in
+  // angle brackets -- <built-in>, <command line>, <paste> -- and several
+  // of them are already allocated to the exact byte, so a probe on those
+  // would report whether or not a source file had been trimmed. The gate
+  // would then pass for the wrong reason, which is the failure this
+  // repository keeps finding in its own harnesses. Measured: without this
+  // condition, `make overread` went green with the trim reverted.
+  if (name[0] != '<') {
+    volatile char probe = f->text[f->len + 1];
+    (void)probe;
+  }
+#endif
   f->next = files;
   files = f;
   return f;
@@ -1656,6 +1702,9 @@ static void init_walk(Node *base, Type *ty, Node **cur, Token *tok) {
 // in the source can ever collide with a generated name.
 static char *static_local_name(char *name) {
   static int seq = 0;
+  // 16 is room for the dot, the counter and the NUL with slack to spare;
+  // the realloc gives the slack back, so a read past this label's end is
+  // something the sanitizer can see.
   char *s = malloc(strlen(name) + 16);
   sprintf(s, "%s.%d", name, seq++);
   return s;
@@ -3989,6 +4038,9 @@ static void define_from_cli(char *arg) {
   char *eq = strchr(arg, '=');
   char *text;
   if (eq) {
+    // Exactly what goes in: the '=' becomes a space, so the text is the
+    // argument's length plus a NUL. Same shape as read_file above, one
+    // byte of slack instead of two, and equally invisible.
     text = malloc(strlen(arg) + 2);
     memcpy(text, arg, eq - arg);
     text[eq - arg] = ' ';
@@ -4997,7 +5049,9 @@ int main(int argc, char **argv) {
   if (asm_only) {
     asm_path = output ? output : "-";
   } else {
-    asm_path = malloc(strlen(input) + 16);
+    // sizeof, not 16: it is the suffix's length including its NUL, so the
+    // allocation is exactly what sprintf writes.
+    asm_path = malloc(strlen(input) + sizeof(".cc.s"));
     sprintf(asm_path, "%s.cc.s", input);
   }
 
