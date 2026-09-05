@@ -201,6 +201,7 @@ struct Token {
   int line;
   bool num_long;      // TK_NUM: an L suffix, or too large for an int
   bool num_unsigned;  // TK_NUM: a U suffix
+  bool num_float;     // TK_NUM: a floating constant, refused where it is used
   bool at_bol;     // first token on its line: only here can a '#' be a directive
   bool has_space;  // whitespace preceded it, which '#' stringification must preserve
   HideSet *hide;   // macros this token may not be re-expanded by
@@ -331,6 +332,35 @@ static Token *tokenize(File *file) {
       p = q + 2;
       tk_space = true;  // a comment is whitespace, and may not join two tokens
       continue;
+    }
+
+    // A floating constant is lexed as ONE token and refused where it is
+    // USED, which is the same line this compiler already draws for the
+    // types: a float may be declared, because real headers declare them,
+    // and may not be operated on. Refusing in the tokenizer instead would
+    // reject a header for a literal in a branch the program never takes,
+    // since tokenizing happens before any #if is evaluated.
+    //
+    // It also stops a misleading diagnostic. "100.0" used to lex as 100,
+    // then '.', then 0, so a program with a double in it was turned away
+    // with "'.' applied to something that is not a struct or union" --
+    // true of the tokens and no help at all. Five c-testsuite cases got
+    // that message.
+    if (isdigit((unsigned char)*p) || (*p == '.' && isdigit((unsigned char)p[1]))) {
+      char *fstart = p;
+      if (*p != '.') strtoul(p, &p, 0);
+      bool is_float = (*p == '.') ||
+                      ((*p == 'e' || *p == 'E') &&
+                       (isdigit((unsigned char)p[1]) ||
+                        ((p[1] == '+' || p[1] == '-') && isdigit((unsigned char)p[2]))));
+      if (is_float) {
+        strtod(fstart, &p);
+        while (*p == 'f' || *p == 'F' || *p == 'l' || *p == 'L') p++;
+        cur = cur->next = new_token(TK_NUM, fstart, p);
+        cur->num_float = true;
+        continue;
+      }
+      p = fstart;
     }
 
     if (isdigit((unsigned char)*p)) {
@@ -2106,6 +2136,10 @@ static Node *primary(void) {
   }
 
   if (tk->kind == TK_NUM) {
+    if (tk->num_float)
+      error_at(tk->loc, "floating point is not implemented: a float or double "
+                        "can be declared, which is what real headers need, "
+                        "but not used");
     Node *n = new_num(tk->val, tk);
     if (tk->num_long)
       n->ty = tk->num_unsigned ? ty_ulong : ty_long;

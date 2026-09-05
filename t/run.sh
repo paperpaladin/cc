@@ -44,8 +44,16 @@ check() {
 # failure mode of an unimplemented feature is not a missing error message --
 # it is silently generating wrong code for something that looked close
 # enough. If one of these ever starts passing, that is the thing to check.
+# An optional second argument is a substring the message must contain. A
+# refusal's exit status says only that cc declined; it says nothing about
+# whether the reader was told something true. Five c-testsuite cases were
+# turned away from a program containing 100.0 with "'.' applied to
+# something that is not a struct or union", which is a fact about the
+# tokens and no help at all, and exit 1 is the same either way, so nothing
+# here could see the difference.
 unimpl() {
   src="$1"
+  want="${2:-}"
   printf '%s' "$src" > "$T.c"
   "$CCBIN" "$T.c" -o "$T.bin" 2> "$T.err"
   rc=$?
@@ -62,6 +70,12 @@ unimpl() {
   if ! gcc -w -c "$T.c" -o /dev/null 2> /dev/null; then
     fail=$((fail + 1))
     printf 'FAIL (not valid C, so refuse() is the right helper) %s\n' "$src"
+    return
+  fi
+  if [ -n "$want" ] && ! grep -q "$want" "$T.err"; then
+    fail=$((fail + 1))
+    printf 'FAIL (refused, but the message does not say "%s") %s\n' "$want" "$src"
+    sed 's/^/        /' "$T.err"
     return
   fi
   pass=$((pass + 1))
@@ -956,6 +970,28 @@ check 100 'int main(){ int a[3] = {1}; return a[0]*100+a[1]*10+a[2]; }'
 refuse 'int a[2] = {[5] = 1}; int main(){ return a[0]; }'
 refuse 'int main(){ int a[2] = {[5] = 1}; return a[0]; }'
 refuse 'struct P { int x; }; int main(){ struct P p = {.nope = 1}; return p.x; }'
+
+# --- floating constants (PLAN 20)
+# A float may be declared and may not be operated on, and a floating
+# LITERAL now follows the same line: one token, refused where it is used.
+# The message is part of each case, because the exit status is 1 whether or
+# not the reader is told anything true.
+unimpl 'int main(void){ double d = 1.5; return d > 0; }'   'floating point is not implemented'
+unimpl 'int main(void){ return 1.5 > 1.0; }'               'floating point is not implemented'
+unimpl 'int main(void){ float f = 0.5f; return f > 0; }'   'floating point is not implemented'
+unimpl 'int main(void){ double d = .5; return d > 0; }'    'floating point is not implemented'
+unimpl 'int main(void){ double d = 1e3; return d > 0; }'   'floating point is not implemented'
+unimpl 'int main(void){ double d = 2.5e-3; return d > 0; }' 'floating point is not implemented'
+
+# And the reason the refusal is at the point of use rather than in the
+# tokenizer. Tokenizing happens over the whole file before any #if is
+# evaluated, so refusing a floating constant where it is LEXED rejects a
+# header for a literal nothing ever reaches: <math.h> defines HUGE_VAL as
+# 1e10000 and <features.h> has 4.1 inside a #warning message. Measured,
+# with the refusal moved into the tokenizer: 7 of the 12 headers this
+# compiler is pointed at stopped compiling.
+check_src 7 '#include <math.h>
+int main(void){ return 7; }'
 
 # A predefine is the easiest thing in a compiler to get silently wrong:
 # nothing fails, the header just takes the other branch. glibc's
