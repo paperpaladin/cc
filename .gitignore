@@ -11,3 +11,4 @@ t/ref.bin
 scratch/
 /cc-overread
 t/overread.*
+t/fuzz-fail-*.c
