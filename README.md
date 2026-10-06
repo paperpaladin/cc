@@ -29,8 +29,8 @@ $ make self-host
 ok   stage 1: cc compiles cc.c
 ok   stage 2: cc2 compiles cc.c
 ok   the fixpoint: cc2 and cc3 are byte-identical
-ok   cc2 passes t/run.sh  (329 passed, 0 failed)
-ok   cc2 passes t/cpp.sh  (64 passed, 0 failed)
+ok   cc2 passes t/run.sh  (408 passed, 0 failed)
+ok   cc2 passes t/cpp.sh  (70 passed, 0 failed)
 ok   cc2 builds an ordinary program through real headers
 
 6 passed, 0 failed
@@ -54,13 +54,37 @@ has teeth.
 
 ```
 $ make test        # exit-status assertions; two harnesses, two summaries
-329 passed, 0 failed
-64 passed, 0 failed
+408 passed, 0 failed
+70 passed, 0 failed
 
 $ make diff-test   # the oracle that matters
-282 agree with gcc+clang, 0 disagree, 7 skipped
-10 multi-line case(s) in t/run.sh are not differential-tested
+323 agree with gcc+clang, 0 disagree, 7 skipped
+11 multi-line case(s) in t/run.sh are not differential-tested
+
+$ make conformance # 220 programs nobody here wrote
+c-testsuite: 195 of 220 pass (88%)
+  no regressions against t/cts-baseline.txt
+  by kind:
+       25 refused
+
+$ make overread    # the sanitizer can see the end of the source buffer
+ok   the planted read past the file buffer is reported
 ```
+
+Two suites, two summaries, deliberately never added together. `t/run.sh`
+asserts exit statuses and `t/cpp.sh` asserts preprocessor output, and they
+answer different questions, so 408 and 70 are quoted apart and 478 appears
+nowhere. The collection's audit knows this repository reports them that
+way.
+
+`make diff-test` was broken for fifteen days and nobody noticed, because
+it is not part of `make test`. Three enum bitfield cases were added across
+two lines each using `check` rather than `check_src`, and the extraction
+that builds this harness's subject reads one line at a time, so the first
+of them reached it as an unterminated quote and the sourced file stopped
+parsing. The script ended there, before the floor check that exists for
+exactly this, and printed one `Syntax error` line and exit 2. It now runs
+`sh -n` over the extract first and names the offending line numbers.
 
 The 7 skips are named in the output, which they were not until recently. Two
 are `printf`/`strlen` without a declaration, clang 19 defaults to C23, where
@@ -93,6 +117,14 @@ Initialisers: `int a[3] = {1,2,3}`, `int a[] = {1,2}` with inferred length,
 and nested forms: arrays of structs, structs containing arrays, 2D arrays.
 Omitted elements are zero-initialised explicitly, because a local lives on an
 uninitialised stack.
+
+Designators, `[2] = v` and `.member = v`, in both static and local
+initialisers, mixed freely with positional elements, which continue from
+wherever the last designator left the cursor. An unsized array takes its
+length from the highest index reached rather than from the comma count, so
+`int a[] = {5, [2] = 2, 3}` has four elements. A local list holding a
+designator is zeroed before it is written rather than after, because a
+designator can go backwards and the trailing fill would undo it.
 
 Calls, definitions and calls up to 6 arguments, recursion, and calls into
 libc that get the ABI right.
@@ -145,14 +177,24 @@ function-like macros, `#undef`, the full `#if`/`#ifdef`/`#ifndef`/`#elif`/
 `#else`/`#endif` family with constant-expression evaluation and `defined`,
 `#` stringification, `##` pasting, variadic macros including the GNU
 `, ## __VA_ARGS__` comma deletion and the GNU `args...` naming, `__FILE__`,
-`__LINE__`, `#error`, and `-D`/`-U` on the command line. `-E` prints the
-result.
+`__LINE__`, `#error`, `#include_next`, `#pragma push_macro` and `pop_macro`,
+and `-D`/`-U` on the command line. `-E` prints the result.
+
+`L'x'`, `u'x'` and `U'x'` character constants, which are not decoration:
+glibc settles `WCHAR_MAX` in `<bits/wchar.h>` with `#elif L'\0' - 1 > 0`, so
+a tokenizer that cannot lex that cannot read `<wchar.h>` at all, and the
+symptom is an undefined identifier `L` pointing into a system header. The
+value is not truncated to a signed char the way a plain `'x'` is, because
+`wchar_t` is a 32-bit int here.
 
 ### What does not
 
-**The preprocessor does not have `_Pragma`, `#include_next`, `__DATE__`,
-`__TIME__` or `__COUNTER__`**, and it does not police the constraint that a
+**The preprocessor does not have `_Pragma`, `#line`, `__DATE__`, `__TIME__`
+or `__COUNTER__`**, and it does not police the constraint that a
 redefinition be identical: a second `#define` silently replaces the first.
+(This used to list `#include_next` here while the Real headers section
+below explained how `#include_next` works. One of the two was wrong for as
+long as both were in the file.)
 A stray backslash outside a string literal is rejected, not carried
 along as a preprocessing token, which is legal C that real preprocessors
 accept. Nothing here needs it, and the tokenizer is simpler without it.
@@ -162,6 +204,20 @@ declarable: they parse, size correctly at 4, 8 and 16, and appear in
 declarations, enough for real headers, but producing a value of
 one is an error, not a silent miscompilation. No `va_arg` of a
 struct.
+
+A floating *constant* follows the same line. `1.5` is one token and is
+refused where it is used, not where it is lexed. That ordering is not a
+detail: tokenizing runs over the whole file before any `#if` is evaluated,
+so refusing at the lexer rejects a header for a literal nothing ever
+reaches. `<math.h>` defines `HUGE_VAL` as `1e10000` and `<features.h>` has
+`4.1` inside a `#warning` message, and with the refusal moved into the
+tokenizer 7 of the 12 headers this compiler is pointed at stop compiling.
+Measured, not reasoned about.
+
+Until recently `100.0` lexed as `100`, then `.`, then `0`, so a program
+with a double in it was turned away with "`.` applied to something that is
+not a struct or union". Five corpus cases got that message. It was a true
+statement about the tokens and no help at all.
 
 `const`, `volatile` and `restrict` parse and are then ignored. There is no
 const-checking here, and saying so is better than implying there is.
@@ -180,7 +236,7 @@ It compiles itself. See the top of this file.
 
 ## Design
 
-One file. Splitting a 4,764-line compiler into `lex.c`/`parse.c`/`codegen.c`
+One file. Splitting a 5,108-line compiler into `lex.c`/`parse.c`/`codegen.c`
 buys nothing while it still fits in a single screen of `ctags`, and a single
 translation unit is easier to self-host later.
 
@@ -194,7 +250,7 @@ ceiling:
   and is not a fix. Compiling this compiler's own source emitted 37,646
   instructions against `gcc -O0`'s 15,925: a 2.4x gap, measured on a
   frozen 4,677-line snapshot of `cc.c` that is **not committed**, so the
-  figure cannot be re-run from this repo and `cc.c` is 4,764 lines now.
+  figure cannot be re-run from this repo and `cc.c` is 5,108 lines now.
   Closing the gap means a real register allocator (PLAN item 22).
 
   Measuring this needs a *frozen* input. That is not obvious until it
@@ -249,7 +305,9 @@ case is skipped as undefined behaviour, not counted against us.
 Cases live in exactly one place. `differential.sh` greps them out of `run.sh`,
 not keeping a second copy in sync.
 
-`t/addcase.sh` adds a case with its expected value **taken from gcc**:
+`t/addcase.sh` is a tool rather than a suite, so it is deliberately not
+reachable from the Makefile. It adds a case with its expected value
+**taken from gcc**:
 
 ```
 $ ./t/addcase.sh 'int main() { int a[]={1,2,3}; return sizeof(a); }'
@@ -261,19 +319,19 @@ one costing a detour through "is this a codegen bug?" The compiler was right eve
 time. So I stopped guessing, gcc already knows, and if gcc and clang disagree the
 program relies on undefined behaviour and has no business in the suite.
 
-`t/cpp.sh` is the same idea aimed at the preprocessor: 64 cases, every
+`t/cpp.sh` is the same idea aimed at the preprocessor: 70 cases, every
 expectation produced by **gcc -E -P and clang -E -P**, both of which must
 agree with us. It includes C99 6.10.3.5 examples 3 and 5 verbatim, which are
 the published torture tests for rescanning, `#`, `##` and variadic macros.
 
 ```
 $ make test
-329 passed, 0 failed
-64 passed, 0 failed
+408 passed, 0 failed
+70 passed, 0 failed
 
 $ make test-asan        # the same suite, watched
-329 passed, 0 failed
-64 passed, 0 failed
+408 passed, 0 failed
+70 passed, 0 failed
 ```
 
 `make test-asan` rebuilds the compiler with AddressSanitizer and
@@ -288,9 +346,67 @@ cheaper to assume it than discover it.
 
 `detect_leaks=0`, because this compiler frees nothing on purpose and
 LeakSanitizer is right every single time it complains. With it on, every case
-fails (measured, "0 passed, 325 failed") since every run ends holding its
-whole AST. All of them saying the same known thing is the fastest way to stop
-reading output.
+fails since every run ends holding its whole AST. Measured today: `1 passed,
+407 failed`, and the 1 is the interesting part, because this used to say
+"0 passed, 325 failed" and call the number the case count. It is not: one
+case gets through. All of them saying the same known thing is the fastest
+way to stop reading output, which is the reason the option is off.
+
+### What the sanitizer could not see
+
+`make test-asan` printed a clean run for as long as it existed, over an
+area smaller than it looked. A buffer larger than its data turns the
+sanitizer off: a read one byte past the end of the data is still inside a
+live allocation, and there is nothing for AddressSanitizer to report.
+
+The buffer here is the one holding the program being compiled and every
+header it pulls in, with a separate `f->len` beside it, which is the most
+untrusted input a compiler has. Two things left slack in it. `read_file`
+allocates the file size plus two, for a newline phase 1 may have to append
+and for a NUL, and usually only one of the two is used. And `splice_lines`
+DELETES a byte for every line continuation without touching the
+allocation, which is the harder half, because no allocation size can see
+it and glibc's headers use continuations constantly.
+
+`new_file` trims the text to its length now, and every buffer that is ever
+tokenized passes through `new_file`: both `read_file` call sites, `-D` on
+the command line, `##` pastes, `#` stringifications, `__FILE__`, `__LINE__`
+and the built-in definitions. One `realloc` rather than eight.
+
+```
+$ make overread
+ok   the planted read past the file buffer is reported
+     READ of size 1 at 0x50300000005f thread T0
+         #0 0x5610a3260e7d in new_file cc.c:120
+```
+
+`-DCC_OVERREAD` compiles a deliberate read of `f->text[f->len + 1]` and
+the target fails unless the sanitizer reports it. Exit 86, because 0 is
+success, 1 is a clean refusal, 2 is a usage error and 127 is a failed
+exec, and a sanitizer report that can be mistaken for any of those is how
+a whole sanitizer build stops meaning anything.
+
+This target is the only witness, and that is measured rather than assumed.
+With the `realloc` reverted, `make overread` fails having had nothing
+reported while `t/run.sh` prints 408 passed, 0 failed and `make test-asan`
+prints 408 and 70 passed.
+
+It also passed for the wrong reason first, which is worth more than the
+fix. The probe fired on every buffer, and several of the synthesized ones
+are already allocated to the exact byte, so with the trim reverted the
+report arrived from `<built-in>` and the target went green. It now probes
+only files whose name is not in angle brackets. A gate watched to fail is
+not the same as a gate watched to fail for the right reason.
+
+Two things that remain, so the next sweep starts from a list. The probe
+file carries a line continuation on purpose, or only `read_file`'s two
+spare bytes would be in play and the invisible half of the shape would go
+ungated. And `static_local_name` still asks for `strlen(name) + 16` bytes
+to hold a label about twelve bytes long, the tokenizer's string literal
+buffer is a bounds-checked `char[4096]`, and five more fixed stack arrays
+are written by `snprintf`. All of them hold short generated text rather
+than input and none has a gate over it, which is a decision rather than
+an oversight.
 
 ### Watching that suite fail
 
@@ -335,7 +451,17 @@ With that case in, the mutant dies.
 $ make fuzz FROM=1 TO=200
 200 agree, 0 disagree, 0 skipped (seeds 1..200)
 reached: 116 enum bit-field, 122 switch, 136 compound assign, 200 struct by value, 200 narrow call, 100 loop (of 200 seeds)
+
+$ make fuzz FROM=1 TO=1200
+1200 agree, 0 disagree, 0 skipped (seeds 1..1200)
+reached: 707 enum bit-field, 750 switch, 798 compound assign, 1200 struct by value, 1200 narrow call, 560 loop (of 1200 seeds)
 ```
+
+The 1200-seed run is the widest this has been taken and it found nothing.
+That is a result and not a reassurance: it bounds what this generator can
+see, and the bound is in the paragraphs below. Everything fixed in this
+repository recently came from the corpus in the next section, not from
+here.
 
 That second line is the point of the first. 400 seeds agreeing is
 either evidence the compiler is right or evidence the generator is
@@ -465,10 +591,10 @@ int n = t->str_len < ty->size ? t->str_len : ty->size;   // char s[3] = "hello"
 ```
 
 turns `char s[3] = "hello"` into a six-byte write into a three-byte buffer.
-The ordinary suite scores it 237 passed. Bytes it tramples are not ones
-the output depends on, so the program still returns 57 and every assertion
-holds. Under the sanitizer build the same case is a heap-buffer-overflow and
-the mutant dies. A test that drives the code over the bug and checks the
+Re-measured with that clamp removed: the ordinary suite prints `408 passed,
+0 failed` and the sanitizer build prints `407 passed, 1 failed`, naming the
+case. Bytes the mutant tramples are not ones the output depends on, so the
+program still returns 57 and every ordinary assertion holds. A test that drives the code over the bug and checks the
 answer is not the same as a test that checks the bug did not happen.
 
 ### Testing an ABI you are only half of
@@ -511,10 +637,10 @@ which was a confident explanation of something that does not happen.
 
 ```
 $ make conformance
-c-testsuite: 186 of 220 pass (84%)
+c-testsuite: 195 of 220 pass (88%)
   no regressions against t/cts-baseline.txt
   by kind:
-       34 refused
+       25 refused
 ```
 
 Every other oracle here compares cc against gcc and clang on programs
@@ -528,7 +654,7 @@ a gap: cc declined, which is the honest answer to a feature it does not
 have. A miscompilation is a bug: cc accepted the program and produced a
 binary that crashed or printed the wrong thing.
 
-All thirty-four remaining failures are the first kind. There were four
+All twenty-five remaining failures are the first kind. There were four
 of the second, all of them invisible until this corpus ran, and all
 four are fixed:
 
@@ -553,6 +679,24 @@ section is about. Skipping an unknown pragma is what the standard
 asks for. Skipping a known one that changes what the preprocessor
 produces is a miscompilation wearing a shrug.
 
+A fifth belongs on that list and did not reach it, because the runner
+reported it as a refusal. **00095**, **00096** and **00136** failed
+with three lines from the assembler:
+
+```
+00095.c.cc.s:8: Error: symbol `x' is already defined
+```
+
+cc had accepted the program, emitted a label for every declaration of
+the name, and handed gas code it could not assemble. gas exited
+non-zero, so cc exited non-zero, so `t/cts.sh` scored a refusal. cc
+had diagnosed nothing. C11 6.9.2p2: `int x;` at file scope is a
+tentative definition and however many of them a translation unit holds,
+they all name one object. The runner still cannot tell this apart from
+a real refusal, and that is the honest statement of its limit: it sees
+an exit status, and a compiler that declines and a compiler that emits
+broken assembly both produce one.
+
 The smallest of them is six lines:
 
 ```c
@@ -572,9 +716,31 @@ call went through whatever those eight bytes held. Fixed, with four
 cases added to `t/run.sh`: the corpus is fetched and skips offline, and
 a fix with no local test is a fix waiting to be undone.
 
-Three remain, and they are item 24: no `__LP64__` predefined, unsigned
-enum bit-fields, and one case whose output diverges later in the
-stream.
+### The twenty-five that are left
+
+Grouped by cause rather than listed, because sixteen causes is the
+useful number and twenty-five case numbers is not:
+
+- floating-point arithmetic, 7 cases (00113, 00119, 00123, 00174,
+  00175, 00195, 00204). The largest single group and the largest piece
+  of work.
+- anonymous `struct` and `union` members, 2 (00046, 00050)
+- GNU statement expressions, `({ ... })` as an expression, 2 (00213, 00214)
+- a forward-declared `enum` tag, which is not ISO C and which gcc
+  accepts, 2 (00170, 00209)
+- brace elision in a nested initialiser, 1 (00205)
+- a declaration mixing function and object declarators, `int f(int),
+  g(int), a;`, 1 (00121)
+- a function returning a function pointer, 1 (00124)
+- an empty struct, plus a compound literal in a static initialiser, 1 (00216)
+- `_Generic`, 1 (00219)
+- `__attribute__((packed))`, 1 (00210)
+- a variable-length array, 1 (00207)
+- a qualifier inside an array declarator, `int x[const 5]`, 1 (00162)
+- a call through a cast to a function-pointer type, 1 (00159)
+- wide string literals, 1 (00220)
+- a 32-byte struct parameter, the MEMORY class, 1 (00140)
+- the `#line` directive, 1 (00152)
 
 The gate is no regression rather than a pass rate, since cc implements a
 subset on purpose and most of these failures are expected. The baseline
@@ -590,9 +756,16 @@ about rights nobody here holds. Offline, the target skips and says so.
 ## Real headers
 
 `<stdio.h>`, `<string.h>`, `<ctype.h>`, `<stdint.h>`, `<limits.h>`,
-`<stdbool.h>`, `<stddef.h>`, `<stdarg.h>` and `<stdlib.h>` are compiled from
-`/usr/include`, and a program calling `printf`, `sprintf` and `strcmp`
-through them runs. That is every header this compiler has been pointed at.
+`<stdbool.h>`, `<stddef.h>`, `<stdarg.h>`, `<stdlib.h>`, `<wchar.h>`,
+`<math.h>` and `<float.h>` are compiled from `/usr/include`, and a program
+calling `printf`, `sprintf` and `strcmp` through them runs. That is every
+header this compiler has been pointed at.
+
+`<wchar.h>` arrived with `L'x'` character constants and nothing else;
+`<math.h>` and `<float.h>` arrived with the decision to refuse a floating
+constant where it is used rather than where it is lexed. Neither needed
+any arithmetic: a header is declarations, and this compiler can read a
+declaration of a type it will not operate on.
 
 `<limits.h>` needed `#include_next`, which exists so that gcc's own
 `limits.h` can reach glibc's: two files of the same name in different

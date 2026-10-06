@@ -593,10 +593,20 @@ the whole suite.
       BLOCKED: csmith is not installed and nothing in this project fetches
             and runs third-party code without being asked. That is a
             decision for whoever owns the machine, not something to do
-            quietly, so this item waits for `dnf install csmith` or an
-            explicit instruction rather than sitting at the top of the
-            queue pretending to be the next thing to do. It was offered as
-            the next action for weeks while being undoable.
+            quietly, so this item waits for an install or an explicit
+            instruction rather than sitting at the top of the queue
+            pretending to be the next thing to do. It was offered as the
+            next action for weeks while being undoable.
+      rechecked 2 November 2026, and the BLOCKED stands, but two things
+            this note said were wrong. `command -v csmith` finds nothing
+            and there is no /usr/include/csmith or /usr/share/csmith, so
+            it is still absent. It is not unavailable, though:
+            `apt-cache policy csmith` reports "Installed: (none),
+            Candidate: 2.3.0-8" from Debian stable/main. And the command
+            named above was `dnf`, which does not exist on this machine;
+            it is Debian, gcc 14.2.0-19, and the command would be
+            `apt install csmith`. A BLOCKED note that names the wrong
+            package manager is a note nobody can act on.
       note: 19b takes the same approach with a generator written here. The
             generator being ours costs nothing, because the ORACLE is
             still gcc and clang, and that is the part that has to be
@@ -662,7 +672,128 @@ the whole suite.
       why: finds the cases I would never think to write. Every expectation I have
            written by hand in this project that was wrong, five so far, would have
            been caught here for free.
-- [ ] 20 fix what 18 and 19 surface, one commit per root cause
+- [x] 20 fix what 18 and 19 surface, one commit per root cause
+      measured first, which changed what the item was. 19 is BLOCKED and
+            19b/19c's generator is what runs in its place: 1200 seeds,
+            1200 agree, 0 disagree, 0 skipped, with the census clearing
+            every floor. It surfaced NOTHING. That is a result and it
+            bounds the generator rather than the compiler: everything
+            below came from 18's corpus, which nobody here wrote.
+      done: a repeated file-scope declaration is one object, not two.
+            00095, 00096 and 00136, and the way they failed matters more
+            than the count. cc ACCEPTED each program, emitted a label per
+            declaration, and gas refused the result with "symbol x is
+            already defined". cc exited non-zero, so t/cts.sh scored a
+            refusal, and cc had diagnosed nothing. A gap and a bug were
+            being reported as the same thing. C11 6.9.2p2: a tentative
+            definition at file scope is one object however many times it
+            is written. Nine cases, five of which die with the fix
+            reverted; the other four are equivalent mutants and are
+            written down as such, two extern orderings that already
+            worked by accident and two refuse cases that still exit 1
+            because gas refuses what cc would not.
+      done: the differential oracle had compared nothing since 70e0876,
+            which is the kind of thing only running it finds. It ranks
+            first in the Oracle list above. Commit 70e0876 added three
+            enum bitfield cases across two lines each using check rather
+            than check_src, and differential.sh builds its subject with a
+            line-at-a-time grep, so the first reached it as an
+            unterminated quote and the sourced file stopped parsing. The
+            script ends at that point, BEFORE the CASES_FLOOR gate that
+            exists for exactly this, so the gate could not fire. Fifteen
+            days of `make diff-test` exiting 2, invisible because
+            diff-test is not part of make test. The three cases are
+            joined onto one line, which keeps them in the oracle, and
+            differential.sh runs sh -n over the extract first and names
+            the unbalanced line numbers. Watched to fail with a two-line
+            check planted.
+      done: L, u and U character constants. 00098 is four lines of it,
+            and glibc needs it too: <bits/wchar.h> settles WCHAR_MAX with
+            "#elif L'\0' - 1 > 0", so <wchar.h> was unreadable and said
+            so as "undefined identifier 'L'" inside a system header. The
+            value is not truncated to a signed char. A wide constant
+            holding more than one byte is refused rather than guessed,
+            because reading one byte of a UTF-8 sequence would be a wrong
+            answer where a refusal was available. Eight cases, all eight
+            die with the branch removed, and one of them, the comparison
+            L'\xc8' > 0, is the only one that dies when the value is
+            truncated instead: returning the value cannot see it, since
+            200 and -56 both exit 200. That is the g(300) trap from item
+            08 for the third time.
+      done: designated initialisers, in the static AND the local path.
+            00092, 00147, 00148, 00150 and 00151, every one of them a
+            file-scope array, so the corpus only asked for half of it.
+            Three pieces: count_init_elems, which measures an unsized
+            array and counted commas where it has to take the highest
+            index; global_init, which needed nothing undone because a
+            static object starts out zero; and init_walk, which emits
+            stores and then zero-fills the tail, which cannot survive a
+            designator going backwards. A local list holding one is
+            zeroed up front and not after.
+            The first version of that answered the designator question
+            AFTER consuming the brace the question starts at, so it
+            always answered no. All five corpus cases still passed, and
+            five local cases disagreed with gcc and clang. My own
+            expected values would have been wrong the same way.
+            20 cases, 17 differential-tested, six mutations all caught.
+      done: a floating constant is one token, refused where it is used.
+            Seven of the remaining refusals are floating point and five
+            were turned away with "'.' applied to something that is not a
+            struct or union", because 100.0 lexed as 100, '.', 0. True of
+            the tokens and no help at all. Refusing at the lexer instead
+            is simpler and wrong, measurably: tokenizing runs over the
+            whole file before any #if, so math.h's HUGE_VAL of 1e10000
+            and features.h's 4.1 inside a #warning are lexed whether or
+            not anything reaches them, and 7 of the 12 headers stop
+            compiling. t/run.sh's unimpl() takes an optional message
+            substring now, because nothing here could otherwise see this
+            fix at all: exit 1 is exit 1 either way. With the compiler
+            change reverted the six cases fail on the message; with the
+            message check also deleted, the same broken compiler reports
+            408 passed, 0 failed.
+            This changes no score. 195 of 220 before and after.
+      result: c-testsuite 186 of 220 to 195 of 220, 88 per cent. All 25
+            remaining failures are refusals, grouped by cause in the
+            README: 7 floating point, 2 anonymous members, 2 statement
+            expressions, 2 forward enum tags, and twelve more one at a
+            time.
+      housekeeping found on the way: fred.txt, two lines reading hello,
+            was swept into commit e32d7d4 by cq c staging the whole tree,
+            and nothing referenced it. And t/fuzz-fail-*.c was in make
+            clean but not in .gitignore, so any commit made after a real
+            fuzz failure would have carried the reproducers; twenty were
+            in the tree during this session from mutation runs.
+- [x] 20b the file buffer was larger than its data, and `make overread`
+      why: not from 18 or 19. It is the collection's buffer shape, and a
+           compiler reading source into a grown buffer and indexing it by
+           a separate length is exactly that shape.
+      done: new_file trims the text to its length. Two things left slack:
+            read_file allocates the file size plus two, for a newline
+            phase 1 may append and for a NUL, usually only one of which
+            is used; and splice_lines DELETES a byte per line
+            continuation without touching the allocation, which is the
+            half no allocation size can see. Either way a read one byte
+            past the end of the file was inside a live allocation and
+            ASan had nothing to report.
+            The trim is in new_file rather than read_file because every
+            buffer that is ever tokenized goes through new_file: both
+            read_file call sites, -D, ## pastes, # stringifications,
+            __FILE__, __LINE__ and the built-ins. One realloc, not eight.
+      proves: `make overread` compiles -DCC_OVERREAD, which plants a read
+            of f->text[f->len + 1], and fails unless ASan reports it.
+            Exit 86, because 0, 1, 2 and 127 all already mean something
+            here. With the realloc reverted it fails while t/run.sh prints
+            408 passed, 0 failed and make test-asan prints 408 and 70.
+            It passed for the wrong reason first: the probe fired on every
+            buffer and several synthesized ones are already exact, so with
+            the trim reverted the report came from <built-in> and the
+            target went green. It probes only files whose name is not in
+            angle brackets now.
+      left: static_local_name still over-allocates for a generated label,
+            the tokenizer's string buffer is a bounds-checked char[4096],
+            and five fixed stack arrays are written by snprintf. All hold
+            short generated text, none has a gate, and that is recorded in
+            the README rather than quietly left.
 - [ ] 21 compile `sqlite3.c`, then run sqlite's own test suite against the result
 
 ### Milestone 3: only after the above is green

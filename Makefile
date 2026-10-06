@@ -37,14 +37,17 @@ self-host: cc
 # detect_leaks=0 is a decision, not a convenience. This compiler frees
 # nothing on purpose -- see the Design section of the README -- so every run
 # ends holding its whole AST, and LeakSanitizer is correct every time it
-# complains. Leaving it on fails EVERY case -- measured: `detect_leaks=1`
-# gives "0 passed, 325 failed" -- because every run ends holding its AST, so
-# the number is just the case count. (This said 236 and the README said 237;
-# both were absolutes for a figure that tracks the suite's size, which is why
-# they drifted apart and away from the truth.) All of them saying the same
-# known thing is the fastest way to stop reading the output. What is
-# being asked here is whether the compiler reads or writes memory it does not
-# own, and that question is still fully answered.
+# complains. Leaving it on fails almost every case -- measured today with
+# `detect_leaks=1`: "1 passed, 407 failed". Almost, not every: this used to
+# say "0 passed, 325 failed" and call the figure the case count, and it is
+# not, because one case gets through. (Before that it said 236 while the
+# README said 237. Both were absolutes for a number that moves with the
+# suite's size, which is how they drifted apart and away from the truth; the
+# figure is re-measured when the suite grows rather than adjusted by
+# arithmetic.) All of them saying the same known thing is the fastest way to
+# stop reading the output. What is being asked here is whether the compiler
+# reads or writes memory it does not own, and that question is still fully
+# answered.
 test-asan: cc.c
 	$(CC) -std=c11 -g -O1 -fsanitize=address,undefined \
 	    -fno-sanitize-recover=all -fno-omit-frame-pointer \
