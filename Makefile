@@ -1,4 +1,4 @@
-CFLAGS = -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -fno-common
+CFLAGS = -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -fno-common -ffile-prefix-map=$(CURDIR)=.
 
 cc: cc.c
 	$(CC) $(CFLAGS) -o $@ $<
