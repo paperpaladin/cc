@@ -487,6 +487,10 @@ static Obj *locals;            // every local in the current function, for stack
 static Obj *globals;
 static char *brk_label;        // innermost loop labels, or NULL
 static char *cont_label;
+static int label_counter = 1;  // names user labels at parse time
+static Node *current_switch;   // innermost switch, so case/default can attach
+static Node *gotos;            // every goto in the current function
+static Node *labels;           // every label in the current function
 
 // One entry per name visible in a scope. A C identifier can be a variable, a
 // typedef, or an enum constant, and which one it is depends on the innermost
@@ -1321,6 +1325,69 @@ static Node *stmt(void) {
     return n;
   }
 
+  if (consume("switch")) {
+    Node *n = new_node(ND_SWITCH, tok);
+    expect("("); n->cond = expr(); expect(")");
+    add_type(n->cond);
+    if (!is_integer(n->cond->ty)) error_at(tok->loc, "switch requires an integer");
+
+    // case and default attach themselves to the innermost switch, and break
+    // inside a switch means "leave the switch", not "leave the enclosing loop".
+    Node *outer = current_switch;
+    char *sb = brk_label;
+    current_switch = n;
+    brk_label = NULL;            // real label assigned during codegen
+    n->then = stmt();
+    current_switch = outer;
+    brk_label = sb;
+    return n;
+  }
+
+  if (consume("case")) {
+    if (!current_switch) error_at(tok->loc, "case outside of a switch");
+    Node *n = new_node(ND_CASE, tok);
+    n->case_val = const_expr();
+    expect(":");
+    n->lhs = stmt();
+    // Prepended, so codegen emits the comparisons in reverse source order. The
+    // order of the tests does not matter; only that each value maps to one label.
+    n->case_next = current_switch->case_next;
+    current_switch->case_next = n;
+    return n;
+  }
+
+  if (consume("default")) {
+    if (!current_switch) error_at(tok->loc, "default outside of a switch");
+    if (current_switch->default_case) error_at(tok->loc, "duplicate default");
+    expect(":");
+    Node *n = new_node(ND_CASE, tok);
+    n->lhs = stmt();
+    current_switch->default_case = n;
+    return n;
+  }
+
+  if (consume("goto")) {
+    Node *n = new_node(ND_GOTO, tok);
+    n->label = get_ident();
+    expect(";");
+    n->goto_next = gotos;         // resolved against labels once the body is parsed
+    gotos = n;
+    return n;
+  }
+
+  // A labelled statement:  ident ":" stmt
+  if (tk->kind == TK_IDENT && tok_is(tk->next, ":")) {
+    Node *n = new_node(ND_LABEL, tok);
+    n->label = strndup(tk->loc, tk->len);
+    tk = tk->next; tk = tk->next;
+    n->unique_label = calloc(1, 32);
+    snprintf(n->unique_label, 32, ".L.user.%d", label_counter++);
+    n->lhs = stmt();
+    n->goto_next = labels;
+    labels = n;
+    return n;
+  }
+
   if (consume("break"))    { expect(";"); return new_node(ND_BREAK, tok); }
   if (consume("continue")) { expect(";"); return new_node(ND_CONTINUE, tok); }
 
@@ -1414,9 +1481,21 @@ static Obj *function(Type *base) {
 
   expect("{");
   fn->is_definition = true;
+  gotos = labels = NULL;
   fn->body = compound_stmt();
   fn->locals = locals;
   leave_scope();
+
+  // A goto may refer to a label further down the function, so resolution has to
+  // wait until the whole body is parsed. Labels are function-scoped, not
+  // block-scoped, which is why they do not live in the Scope stack.
+  for (Node *g = gotos; g; g = g->goto_next) {
+    Node *target = NULL;
+    for (Node *l = labels; l; l = l->goto_next)
+      if (!strcmp(g->label, l->label)) { target = l; break; }
+    if (!target) error_at(g->tok->loc, "use of undeclared label '%s'", g->label);
+    g->unique_label = target->unique_label;
+  }
 
   int off = 0;
   for (Obj *v = fn->locals; v; v = v->next) {
@@ -1826,8 +1905,53 @@ static void gen_stmt(Node *n) {
     brk_label = sb; cont_label = sc;
     return;
   }
+  case ND_SWITCH: {
+    int c = label_id++;
+    char brk[32];
+    snprintf(brk, sizeof(brk), ".L.brk.%d", c);
+    char *sb = brk_label;
+    brk_label = brk;
+
+    gen_expr(n->cond);
+    char *reg = (n->cond->ty->size == 8) ? "%rax" : "%eax";
+
+    // A linear chain of compares. shortcut: a jump table would be faster for a
+    // dense switch; nothing in t/ has enough cases for it to show up.
+    for (Node *cs = n->case_next; cs; cs = cs->case_next) {
+      cs->case_lbl = calloc(1, 40);
+      snprintf(cs->case_lbl, 40, ".L.case.%d.%d", c, label_id++);
+      emit("cmp $%ld, %s", cs->case_val, reg);
+      emit("je %s", cs->case_lbl);
+    }
+
+    if (n->default_case) {
+      n->default_case->case_lbl = calloc(1, 40);
+      snprintf(n->default_case->case_lbl, 40, ".L.default.%d", c);
+      emit("jmp %s", n->default_case->case_lbl);
+    } else {
+      emit("jmp %s", brk);
+    }
+
+    gen_stmt(n->then);
+    fprintf(out, "%s:\n", brk);
+    brk_label = sb;
+    return;
+  }
+  case ND_CASE:
+    // Fallthrough is the default and comes for free: the label is emitted inline
+    // and control simply continues into whatever follows.
+    fprintf(out, "%s:\n", n->case_lbl);
+    gen_stmt(n->lhs);
+    return;
+  case ND_GOTO:
+    emit("jmp %s", n->unique_label);
+    return;
+  case ND_LABEL:
+    fprintf(out, "%s:\n", n->unique_label);
+    gen_stmt(n->lhs);
+    return;
   case ND_BREAK:
-    if (!brk_label) error_at(n->tok->loc, "break outside of a loop");
+    if (!brk_label) error_at(n->tok->loc, "break outside of a loop or switch");
     emit("jmp %s", brk_label);
     return;
   case ND_CONTINUE:
