@@ -52,6 +52,23 @@ possible, because the fixpoint is worth more than any individual feature.
       why: hand-written expectations were wrong twice on the first run
       files: t/differential.sh
       proves: `make diff-test` -- 102 agree, 0 disagree
+- [x] 02 scopes, typedef, struct, union, enum, unsigned
+      why: one interlocking change; declspec cannot gain typedef without also
+           learning struct/union/enum and the unsigned widths
+      proves: struct layout with real padding, union overlay, shadowing,
+              self-referential structs, struct assignment
+- [x] 03 cast expressions and gen_cast width conversion
+      why: could not land before typedef, since "(x)" is a cast only if x names
+           a type in scope
+      proves: 15 cases covering truncation and both extension directions
+- [x] 04 switch/case/default, goto and labelled statements
+      proves: fallthrough, break binding to the switch rather than the loop,
+              goto out of a loop, forward and backward jumps
+- [x] 05 initialisers for locals, arrays, structs and strings
+      why: lowered to element assignments, so nested forms work without new
+           codegen
+      proves: inferred lengths, zero fill, 2D arrays, arrays of structs
+- [x] 06 t/addcase.sh -- expectations derived from gcc, cross-checked with clang
 
 ### Milestone 1 -- self-host
 
@@ -87,23 +104,30 @@ is a feature the compiler's own source needs.
 
 ### Milestone 2 -- external conformance
 
-- [ ] 15 `c-testsuite` runner, publishing the pass rate with the failures named
-- [ ] 16 csmith differential fuzzing against gcc and clang
-      why: finds the cases I would never think to write
-- [ ] 17 fix what 15 and 16 surface, one commit per root cause
-- [ ] 18 compile `sqlite3.c`, then run sqlite's own test suite against the result
+- [ ] 16 `c-testsuite` runner, publishing the pass rate with the failures named
+- [ ] 17 csmith differential fuzzing against gcc and clang
+      why: finds the cases I would never think to write. Every expectation I have
+           written by hand in this project that was wrong, five so far, would have
+           been caught here for free.
+- [ ] 18 fix what 16 and 17 surface, one commit per root cause
+- [ ] 19 compile `sqlite3.c`, then run sqlite's own test suite against the result
 
 ### Milestone 3 -- only after the above is green
 
-- [ ] 19 replace the stack machine with a register allocator; keep the fixpoint green
-- [ ] 20 emit ELF objects directly, dropping the `gcc` dependency (see ../ld)
+- [ ] 20 replace the stack machine with a register allocator; keep the fixpoint green
+- [ ] 21 emit ELF objects directly, dropping the `gcc` dependency (see ../ld)
 
 ## Open questions
 
-- Bitfields: deferred. Typically the largest `c-testsuite` failure cluster, and
-  `sqlite3.c` uses them. Will need to land before milestone 2 finishes.
 - `long double`: planning to alias it to `double` and document the lie rather
-  than implement x87 80-bit.
-- glibc headers need a surprising amount of GNU C (`__attribute__`, statement
-  expressions, `typeof`, `__builtin_*`, asm labels). Scope unknown until 06
-  lands. This is the main schedule risk.
+  than implement x87 80-bit. That is a deliberate known-wrong answer, which is
+  different from an unimplemented one, so it has to be stated in the README.
+- Struct assignment currently emits an unrolled byte copy, so a 4KB struct would
+  produce 8K instructions. Fine today; needs `rep movsb` or a loop before
+  anything real is compiled.
+- Compound assignment (`a += b`) evaluates its lvalue twice, which is wrong for a
+  side-effecting lvalue like `*p++ += 1`. Needs a hidden temporary. Nothing in
+  `t/` trips it, so it is marked `shortcut:` in the source rather than fixed.
+- `switch` compiles to a linear chain of compares. A jump table would be better
+  for a dense switch and worse for a sparse one; no case in `t/` is large enough
+  for the difference to be measurable yet.

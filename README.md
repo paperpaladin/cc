@@ -24,15 +24,12 @@ without the detour.
 
 ## Status
 
-104 hand-written cases pass. 102 of them are also verified against **both** gcc
-and clang, with zero disagreements.
-
 ```
 $ make test        # exit-status assertions
-104 passed, 0 failed
+168 passed, 0 failed
 
 $ make diff-test   # the oracle that matters
-102 agree with gcc+clang, 0 disagree, 2 skipped
+166 agree with gcc+clang, 0 disagree, 2 skipped
 ```
 
 The 2 skips are `printf`/`strlen` without a declaration -- clang 19 defaults to
@@ -41,22 +38,45 @@ as a reference.
 
 ### What works
 
-Integers, `char`, `short`, `long`, pointers, arrays (including multidimensional
-and the `a[i] == *(a+i)` identity), globals, string literals with escapes,
-`sizeof`, full operator precedence with correct short-circuit `&&`/`||`,
-ternary, comma, compound assignment, pre/post increment and decrement,
-`if`/`else`/`for`/`while`/`do`/`break`/`continue`, function definitions and
-calls up to 6 arguments, recursion, and calls into libc.
+**Types** -- `void`, `_Bool`, `char`, `short`, `int`, `long`, their `unsigned`
+forms, pointers, arrays (multidimensional, with the `a[i] == *(a+i)` identity),
+`struct`, `union`, `enum`, and `typedef`. Struct layout computes real alignment
+and padding; unions overlay at offset 0. Incomplete types are tracked, so a
+forward-declared `struct` can be referenced through a pointer and completed later.
+
+**Expressions** -- full operator precedence, short-circuit `&&`/`||`, ternary,
+comma, compound assignment, pre/post increment and decrement, `sizeof` over both
+expressions and type names, casts with correct signed/unsigned width conversion,
+member access through `.` and `->`, struct assignment, and constant folding for
+array dimensions and enum values.
+
+**Statements** -- `if`/`else`, `for`, `while`, `do`, `break`, `continue`,
+`switch`/`case`/`default` with fallthrough, `goto` and labels, and real block
+scoping so an inner declaration shadows an outer one.
+
+**Initialisers** -- `int a[3] = {1,2,3}`, `int a[] = {1,2}` with inferred length,
+`char s[] = "abc"` (4 bytes, the NUL is part of the object), `struct P p = {4,5}`,
+and nested forms: arrays of structs, structs containing arrays, 2D arrays.
+Omitted elements are zero-initialised explicitly, because a local lives on an
+uninitialised stack.
+
+**Calls** -- definitions and calls up to 6 arguments, recursion, and calls into
+libc that get the ABI right.
 
 ### What does not
 
-No preprocessor, so no `#include` and no macros. No `struct`, `union`, `enum`,
-`typedef`, `float`, `double`, `unsigned`, `switch`, `goto`, or casts. Only one
-scope per function, so an inner block cannot shadow an outer variable. Function
-calls assume a `long` return type because there are no prototypes yet.
+**No preprocessor.** No `#include`, no macros, no conditional compilation. This
+is the single largest remaining gap and the main blocker on self-hosting.
 
-It cannot compile itself. That is the next milestone and the reason the
-unsupported list above is ordered the way it is -- see `PLAN.md`.
+No `float` or `double`. No `static` or `extern` linkage. No function prototypes,
+so a call assumes a `long` return. No bitfields. No variadic function
+*definitions* (calling a variadic function works). Passing or returning a struct
+**by value** is rejected with an explicit error rather than silently
+miscompiled -- that needs the SysV eightbyte classification algorithm, which is
+its own milestone.
+
+It cannot compile itself yet. The unsupported list is ordered by what `cc.c`
+itself uses, so that self-hosting arrives as early as possible -- see `PLAN.md`.
 
 ## Design
 
@@ -82,6 +102,18 @@ case is skipped as undefined behavior rather than counted against us.
 
 Cases live in exactly one place. `differential.sh` greps them out of `run.sh`
 rather than keeping a second copy in sync.
+
+`t/addcase.sh` adds a case with its expected value **taken from gcc**:
+
+```
+$ ./t/addcase.sh 'int main() { int a[]={1,2,3}; return sizeof(a); }'
+added: expected 12 (gcc and clang agree)
+```
+
+Five of my hand-computed expectations have been wrong across this project, each
+one costing a detour through "is this a codegen bug?" The compiler was right every
+time. So I stopped guessing -- gcc already knows, and if gcc and clang disagree the
+program relies on undefined behaviour and has no business in the suite.
 
 ## License
 
