@@ -91,7 +91,9 @@ static bool is_ident2(char c) { return is_ident1(c) || isdigit((unsigned char)c)
 
 static char *KEYWORDS[] = {
   "return", "if", "else", "for", "while", "do", "break", "continue",
-  "int", "char", "long", "short", "void", "sizeof", NULL,
+  "int", "char", "long", "short", "void", "sizeof", "typedef",
+  "struct", "union", "enum", "switch", "case", "default", "goto",
+  "unsigned", "signed", "_Bool", NULL,
 };
 
 static bool is_keyword(Token *t) {
@@ -234,45 +236,90 @@ static Token *tokenize(void) {
 
 // ----------------------------------------------------------------- type system
 
-typedef enum { TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_PTR, TY_ARRAY, TY_FUNC } TypeKind;
+typedef enum {
+  TY_VOID, TY_BOOL, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_ENUM,
+  TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_FUNC,
+} TypeKind;
 
+typedef struct Member Member;
 typedef struct Type Type;
+
 struct Type {
   TypeKind kind;
   int size;
+  int align;         // a struct's alignment is its widest member's
+  bool is_unsigned;
   Type *base;        // TY_PTR / TY_ARRAY element type
   int array_len;
   Type *ret;         // TY_FUNC
+  Member *members;   // TY_STRUCT / TY_UNION
 };
 
-static Type *ty_void  = &(Type){TY_VOID,  1};
-static Type *ty_char  = &(Type){TY_CHAR,  1};
-static Type *ty_short = &(Type){TY_SHORT, 2};
-static Type *ty_int   = &(Type){TY_INT,   4};
-static Type *ty_long  = &(Type){TY_LONG,  8};
+struct Member {
+  Member *next;
+  char *name;
+  Type *ty;
+  int offset;
+};
+
+static int align_to(int n, int a);
+
+// Designated initialisers, so adding a field to Type does not produce a
+// missing-initialiser warning on every one of these.
+#define PRIM(k, sz, uns) &(Type){.kind = (k), .size = (sz), .align = (sz), .is_unsigned = (uns)}
+static Type *ty_void   = PRIM(TY_VOID,  1, false);
+static Type *ty_bool   = PRIM(TY_BOOL,  1, false);
+static Type *ty_char   = PRIM(TY_CHAR,  1, false);
+static Type *ty_uchar  = PRIM(TY_CHAR,  1, true);
+static Type *ty_short  = PRIM(TY_SHORT, 2, false);
+static Type *ty_ushort = PRIM(TY_SHORT, 2, true);
+static Type *ty_int    = PRIM(TY_INT,   4, false);
+static Type *ty_uint   = PRIM(TY_INT,   4, true);
+static Type *ty_long   = PRIM(TY_LONG,  8, false);
+static Type *ty_ulong  = PRIM(TY_LONG,  8, true);
+#undef PRIM
 
 static Type *pointer_to(Type *base) {
   Type *t = calloc(1, sizeof(Type));
-  t->kind = TY_PTR; t->size = 8; t->base = base;
+  t->kind = TY_PTR; t->size = 8; t->align = 8; t->base = base;
+  t->is_unsigned = true;            // addresses compare as unsigned
   return t;
 }
 
 static Type *array_of(Type *base, int len) {
   Type *t = calloc(1, sizeof(Type));
-  t->kind = TY_ARRAY; t->size = base->size * len; t->base = base; t->array_len = len;
+  t->kind = TY_ARRAY; t->size = base->size * len; t->align = base->align;
+  t->base = base; t->array_len = len;
   return t;
 }
 
 static Type *func_returning(Type *ret) {
   Type *t = calloc(1, sizeof(Type));
-  t->kind = TY_FUNC; t->size = 8; t->ret = ret;
+  t->kind = TY_FUNC; t->size = 8; t->align = 8; t->ret = ret;
+  return t;
+}
+
+static Type *new_enum_type(void) {
+  Type *t = calloc(1, sizeof(Type));
+  t->kind = TY_ENUM; t->size = 4; t->align = 4;
   return t;
 }
 
 static bool is_integer(Type *t) {
-  return t->kind == TY_CHAR || t->kind == TY_SHORT || t->kind == TY_INT || t->kind == TY_LONG;
+  switch (t->kind) {
+  case TY_BOOL: case TY_CHAR: case TY_SHORT: case TY_INT: case TY_LONG: case TY_ENUM:
+    return true;
+  default:
+    return false;
+  }
 }
 static bool is_pointer(Type *t) { return t->kind == TY_PTR || t->kind == TY_ARRAY; }
+static bool is_aggregate(Type *t) { return t->kind == TY_STRUCT || t->kind == TY_UNION; }
+
+// An aggregate and an array both evaluate to their own address rather than to a
+// loadable value, which is the single rule that makes member access, array
+// indexing and struct copying all fall out of the same codegen.
+static bool is_address_valued(Type *t) { return t->kind == TY_ARRAY || is_aggregate(t); }
 
 // ------------------------------------------------------------------------ AST
 
@@ -280,9 +327,9 @@ typedef enum {
   ND_NUM, ND_VAR, ND_ADD, ND_SUB, ND_MUL, ND_DIV, ND_MOD, ND_NEG,
   ND_EQ, ND_NE, ND_LT, ND_LE, ND_ASSIGN, ND_ADDR, ND_DEREF,
   ND_AND, ND_OR, ND_NOT, ND_BITAND, ND_BITOR, ND_BITXOR, ND_BITNOT,
-  ND_SHL, ND_SHR, ND_COND, ND_COMMA, ND_CAST,
+  ND_SHL, ND_SHR, ND_COND, ND_COMMA, ND_CAST, ND_MEMBER,
   ND_RETURN, ND_IF, ND_FOR, ND_DO, ND_BLOCK, ND_FUNCALL, ND_EXPR_STMT,
-  ND_BREAK, ND_CONTINUE,
+  ND_BREAK, ND_CONTINUE, ND_SWITCH, ND_CASE, ND_GOTO, ND_LABEL,
 } NodeKind;
 
 typedef struct Node Node;
@@ -324,6 +371,21 @@ struct Node {
   char *funcname;
   Node *args;
 
+  Member *member;  // ND_MEMBER
+
+  // ND_SWITCH / ND_CASE
+  Node *case_next;       // next case within the enclosing switch
+  Node *default_case;
+  long case_val;
+  char *brk_lbl;         // labels assigned during codegen
+  char *cont_lbl;
+  char *case_lbl;
+
+  // ND_GOTO / ND_LABEL
+  char *label;
+  char *unique_label;
+  Node *goto_next;
+
   Obj *var;        // ND_VAR
   long val;        // ND_NUM
 };
@@ -344,9 +406,6 @@ static Node *new_num(long v, Token *tok) {
 }
 static Node *new_var_node(Obj *var, Token *tok) {
   Node *n = new_node(ND_VAR, tok); n->var = var; n->ty = var->ty; return n;
-}
-static Node *new_cast(Node *expr, Type *ty) {
-  Node *n = new_node(ND_CAST, expr->tok); n->lhs = expr; n->ty = ty; return n;
 }
 
 // Propagate types bottom-up. Called once per node after it is built.
@@ -371,7 +430,13 @@ static void add_type(Node *n) {
     return;
   case ND_ASSIGN:
     if (n->lhs->ty->kind == TY_ARRAY) error_at(n->tok->loc, "not an lvalue");
+    if (is_aggregate(n->lhs->ty) && n->lhs->ty != n->rhs->ty &&
+        n->lhs->ty->size != n->rhs->ty->size)
+      error_at(n->tok->loc, "incompatible types in struct assignment");
     n->ty = n->lhs->ty;
+    return;
+  case ND_MEMBER:
+    n->ty = n->member->ty;
     return;
   case ND_EQ: case ND_NE: case ND_LT: case ND_LE:
   case ND_AND: case ND_OR: case ND_NOT:
@@ -408,10 +473,75 @@ static void add_type(Node *n) {
 // ----------------------------------------------------------------- the parser
 
 static Token *tk;              // cursor
-static Obj *locals;            // current function's locals
+static Obj *locals;            // every local in the current function, for stack
+                               // allocation. Lookups go through `scope`, not here.
 static Obj *globals;
 static char *brk_label;        // innermost loop labels, or NULL
 static char *cont_label;
+
+// One entry per name visible in a scope. A C identifier can be a variable, a
+// typedef, or an enum constant, and which one it is depends on the innermost
+// scope that declares it -- so all three live in the same list and shadow each
+// other correctly for free.
+typedef struct VarScope VarScope;
+struct VarScope {
+  VarScope *next;
+  char *name;
+  Obj *var;
+  Type *type_def;
+  Type *enum_ty;
+  int enum_val;
+};
+
+// struct/union/enum tags live in a separate namespace from ordinary identifiers,
+// which is why `struct stat stat;` is legal C.
+typedef struct TagScope TagScope;
+struct TagScope {
+  TagScope *next;
+  char *name;
+  Type *ty;
+};
+
+typedef struct Scope Scope;
+struct Scope {
+  Scope *next;
+  VarScope *vars;
+  TagScope *tags;
+};
+
+static Scope file_scope;
+static Scope *scope = &file_scope;
+
+// Storage-class bits picked up by declspec and handed back to its caller.
+typedef struct { bool is_typedef; } VarAttr;
+
+static void enter_scope(void) {
+  Scope *s = calloc(1, sizeof(Scope));
+  s->next = scope;
+  scope = s;
+}
+
+static void leave_scope(void) { scope = scope->next; }
+
+static VarScope *push_scope(char *name) {
+  VarScope *vs = calloc(1, sizeof(VarScope));
+  vs->name = name;
+  vs->next = scope->vars;
+  scope->vars = vs;
+  return vs;
+}
+
+static void push_tag(char *name, Type *ty) {
+  TagScope *ts = calloc(1, sizeof(TagScope));
+  ts->name = name;
+  ts->ty = ty;
+  ts->next = scope->tags;
+  scope->tags = ts;
+}
+
+static bool name_is(char *name, Token *t) {
+  return (int)strlen(name) == t->len && !memcmp(t->loc, name, t->len);
+}
 
 static bool consume(char *s) {
   if (tok_is(tk, s)) { tk = tk->next; return true; }
@@ -435,15 +565,37 @@ static Obj *new_var(char *name, Type *ty, bool is_local) {
   v->name = name; v->ty = ty; v->is_local = is_local;
   if (is_local) { v->next = locals; locals = v; }
   else          { v->next = globals; globals = v; }
+  push_scope(name)->var = v;
   return v;
 }
 
-static Obj *find_var(Token *t) {
-  for (Obj *v = locals; v; v = v->next)
-    if ((int)strlen(v->name) == t->len && !memcmp(t->loc, v->name, t->len)) return v;
-  for (Obj *v = globals; v; v = v->next)
-    if ((int)strlen(v->name) == t->len && !memcmp(t->loc, v->name, t->len)) return v;
+// Innermost scope wins, which is what makes shadowing work.
+static VarScope *find_name(Token *t) {
+  for (Scope *s = scope; s; s = s->next)
+    for (VarScope *vs = s->vars; vs; vs = vs->next)
+      if (name_is(vs->name, t)) return vs;
   return NULL;
+}
+
+static Type *find_tag(Token *t) {
+  for (Scope *s = scope; s; s = s->next)
+    for (TagScope *ts = s->tags; ts; ts = ts->next)
+      if (name_is(ts->name, t)) return ts->ty;
+  return NULL;
+}
+
+// A tag declared in *this* scope only -- needed to tell a redeclaration
+// (struct foo { ... } again) from a reference to an outer one.
+static TagScope *find_tag_here(Token *t) {
+  for (TagScope *ts = scope->tags; ts; ts = ts->next)
+    if (name_is(ts->name, t)) return ts;
+  return NULL;
+}
+
+static Type *find_typedef(Token *t) {
+  if (t->kind != TK_IDENT) return NULL;
+  VarScope *vs = find_name(t);
+  return vs ? vs->type_def : NULL;
 }
 
 static int anon_id = 0;
@@ -458,36 +610,121 @@ static Obj *new_string_literal(Token *t) {
 
 static Node *expr(void);
 static Node *assign(void);
+static Node *conditional(void);
 static Node *stmt(void);
 static Node *compound_stmt(void);
-static Type *declspec(void);
+static Type *declspec(VarAttr *attr);
 static Type *declarator(Type *ty, char **name);
+static Type *struct_union_decl(void);
+static Type *enum_decl(void);
+static long const_expr(void);
 
+static char *TYPE_KEYWORDS[] = {
+  "int", "char", "long", "short", "void", "unsigned", "signed", "_Bool",
+  "struct", "union", "enum", "typedef", NULL,
+};
+
+// A declaration can start with a type keyword, a storage class, or a name that
+// an enclosing scope made into a typedef. That last case is why this needs the
+// scope stack and cannot be a pure lexical test.
 static bool is_typename(void) {
-  return peek("int") || peek("char") || peek("long") || peek("short") || peek("void");
+  for (int i = 0; TYPE_KEYWORDS[i]; i++)
+    if (peek(TYPE_KEYWORDS[i])) return true;
+  return find_typedef(tk) != NULL;
 }
 
 // declspec = ("int" | "char" | "short" | "long" | "void")+
 // We accept the common multi-word spellings ("long long", "unsigned" is not
 // supported) and collapse them to one of our five base types.
-static Type *declspec(void) {
-  if (consume("void")) return ty_void;
-  if (consume("char")) return ty_char;
-  if (consume("short")) { consume("int"); return ty_short; }
-  if (consume("long")) { consume("long"); consume("int"); return ty_long; }
-  if (consume("int")) return ty_int;
-  error_at(tk->loc, "expected a type name");
-  return NULL;
+static Type *declspec(VarAttr *attr) {
+  // Storage class first, and it may appear before or after the type keywords.
+  for (;;) {
+    if (peek("typedef")) {
+      if (!attr) error_at(tk->loc, "typedef is not allowed here");
+      tk = tk->next;
+      attr->is_typedef = true;
+      continue;
+    }
+    break;
+  }
+
+  // "unsigned" and "signed" may stand alone (meaning int) or qualify a width.
+  bool is_unsigned = false, saw_sign = false;
+  while (peek("unsigned") || peek("signed")) {
+    is_unsigned = peek("unsigned");
+    saw_sign = true;
+    tk = tk->next;
+  }
+
+  Type *ty = NULL;
+  if (consume("void")) ty = ty_void;
+  else if (consume("_Bool")) ty = ty_bool;
+  else if (consume("char")) ty = is_unsigned ? ty_uchar : ty_char;
+  else if (consume("short")) { consume("int"); ty = is_unsigned ? ty_ushort : ty_short; }
+  else if (consume("long")) { consume("long"); consume("int"); ty = is_unsigned ? ty_ulong : ty_long; }
+  else if (consume("int")) ty = is_unsigned ? ty_uint : ty_int;
+  else if (saw_sign) ty = is_unsigned ? ty_uint : ty_int;   // bare "unsigned"
+  else if (peek("struct") || peek("union")) ty = struct_union_decl();
+  else if (peek("enum")) ty = enum_decl();
+  else {
+    Type *td = find_typedef(tk);
+    if (!td) error_at(tk->loc, "expected a type name");
+    tk = tk->next;
+    ty = td;
+  }
+
+  // Trailing storage class: "int typedef x;" is legal, if unloved.
+  while (peek("typedef")) {
+    if (!attr) error_at(tk->loc, "typedef is not allowed here");
+    tk = tk->next;
+    attr->is_typedef = true;
+  }
+  return ty;
 }
 
 // Trailing array dimensions: "[3][4]" applied right-to-left.
+// Fold an integer constant expression. Needed for enum values and array
+// dimensions, both of which must be known at compile time.
+static long eval(Node *n) {
+  switch (n->kind) {
+  case ND_NUM:    return n->val;
+  case ND_ADD:    return eval(n->lhs) + eval(n->rhs);
+  case ND_SUB:    return eval(n->lhs) - eval(n->rhs);
+  case ND_MUL:    return eval(n->lhs) * eval(n->rhs);
+  case ND_DIV:    { long d = eval(n->rhs); if (!d) error_at(n->tok->loc, "division by zero in a constant expression"); return eval(n->lhs) / d; }
+  case ND_MOD:    { long d = eval(n->rhs); if (!d) error_at(n->tok->loc, "division by zero in a constant expression"); return eval(n->lhs) % d; }
+  case ND_NEG:    return -eval(n->lhs);
+  case ND_BITNOT: return ~eval(n->lhs);
+  case ND_NOT:    return !eval(n->lhs);
+  case ND_BITAND: return eval(n->lhs) & eval(n->rhs);
+  case ND_BITOR:  return eval(n->lhs) | eval(n->rhs);
+  case ND_BITXOR: return eval(n->lhs) ^ eval(n->rhs);
+  case ND_SHL:    return eval(n->lhs) << eval(n->rhs);
+  case ND_SHR:    return eval(n->lhs) >> eval(n->rhs);
+  case ND_EQ:     return eval(n->lhs) == eval(n->rhs);
+  case ND_NE:     return eval(n->lhs) != eval(n->rhs);
+  case ND_LT:     return eval(n->lhs) <  eval(n->rhs);
+  case ND_LE:     return eval(n->lhs) <= eval(n->rhs);
+  case ND_AND:    return eval(n->lhs) && eval(n->rhs);
+  case ND_OR:     return eval(n->lhs) || eval(n->rhs);
+  case ND_COND:   return eval(n->cond) ? eval(n->then) : eval(n->els);
+  case ND_COMMA:  return eval(n->rhs);
+  case ND_CAST:   return eval(n->lhs);
+  default:
+    error_at(n->tok->loc, "not a compile-time constant");
+    return 0;
+  }
+}
+
+static long const_expr(void) { return eval(conditional()); }
+
 static Type *type_suffix(Type *ty) {
   if (consume("[")) {
-    if (tk->kind != TK_NUM) error_at(tk->loc, "expected an array size");
-    int len = tk->val;
-    tk = tk->next;
+    // A dimension may be any constant expression: [N], [2*N], [sizeof(x)].
+    long len = const_expr();
+    if (len < 0) error_at(tk->loc, "negative array size");
     expect("]");
-    return array_of(type_suffix(ty), len);
+    return array_of(type_suffix(ty), (int)len);
   }
   return ty;
 }
@@ -498,9 +735,123 @@ static Type *declarator(Type *ty, char **name) {
   return type_suffix(ty);
 }
 
+// struct-or-union-specifier = ("struct" | "union") ident? ("{" members "}")?
+static Type *struct_union_decl(void) {
+  bool is_union = peek("union");
+  tk = tk->next;
+
+  Token *tag = NULL;
+  if (tk->kind == TK_IDENT) { tag = tk; tk = tk->next; }
+
+  // A tag with no body is a reference, or a forward declaration if the tag is
+  // not known yet. Incomplete types are marked with size -1 so that using one
+  // by value is caught rather than silently producing a zero-sized object.
+  if (tag && !peek("{")) {
+    Type *known = find_tag(tag);
+    if (known) return known;
+    Type *ty = calloc(1, sizeof(Type));
+    ty->kind = is_union ? TY_UNION : TY_STRUCT;
+    ty->size = -1;
+    ty->align = 1;
+    push_tag(strndup(tag->loc, tag->len), ty);
+    return ty;
+  }
+
+  expect("{");
+  Type *ty = calloc(1, sizeof(Type));
+  ty->kind = is_union ? TY_UNION : TY_STRUCT;
+  ty->align = 1;
+
+  Member head = {0};
+  Member *cur = &head;
+  while (!consume("}")) {
+    Type *base = declspec(NULL);
+    bool first = true;
+    while (!consume(";")) {
+      if (!first) expect(",");
+      first = false;
+      char *name;
+      Type *mty = declarator(base, &name);
+      if (mty->kind == TY_VOID) error_at(tk->loc, "member declared void");
+      if (mty->size < 0) error_at(tk->loc, "member has incomplete type");
+      Member *m = calloc(1, sizeof(Member));
+      m->name = name;
+      m->ty = mty;
+      cur = cur->next = m;
+    }
+  }
+  ty->members = head.next;
+
+  // Layout. A union overlays its members at offset 0 and takes the widest size;
+  // a struct packs them in order with each one aligned, then rounds the total up
+  // to the struct's own alignment so arrays of it stay aligned.
+  int offset = 0;
+  for (Member *m = ty->members; m; m = m->next) {
+    if (is_union) {
+      m->offset = 0;
+      if (ty->size < m->ty->size) ty->size = m->ty->size;
+    } else {
+      offset = align_to(offset, m->ty->align);
+      m->offset = offset;
+      offset += m->ty->size;
+    }
+    if (ty->align < m->ty->align) ty->align = m->ty->align;
+  }
+  if (!is_union) ty->size = offset;
+  ty->size = align_to(ty->size, ty->align);
+
+  if (tag) {
+    TagScope *here = find_tag_here(tag);
+    // Completing a forward declaration must update the type the earlier
+    // references already point at, so copy into it rather than replacing it.
+    if (here) *here->ty = *ty;
+    else push_tag(strndup(tag->loc, tag->len), ty);
+  }
+  return ty;
+}
+
+// enum-specifier = "enum" ident? ("{" ident ("=" const)? ("," ...)* "}")?
+static Type *enum_decl(void) {
+  expect("enum");
+  Token *tag = NULL;
+  if (tk->kind == TK_IDENT) { tag = tk; tk = tk->next; }
+
+  if (tag && !peek("{")) {
+    Type *known = find_tag(tag);
+    if (!known) error_at(tag->loc, "unknown enum tag");
+    return known;
+  }
+
+  expect("{");
+  Type *ty = new_enum_type();
+  long val = 0;
+  bool first = true;
+  while (!consume("}")) {
+    if (!first) expect(",");
+    first = false;
+    if (consume("}")) break;                  // trailing comma
+    char *name = get_ident();
+    if (consume("=")) val = const_expr();
+    VarScope *vs = push_scope(name);
+    vs->enum_ty = ty;
+    vs->enum_val = (int)val++;
+  }
+
+  if (tag) push_tag(strndup(tag->loc, tag->len), ty);
+  return ty;
+}
+
+static Member *get_member(Type *ty, Token *t) {
+  for (Member *m = ty->members; m; m = m->next)
+    if (name_is(m->name, t)) return m;
+  error_at(t->loc, "no member named '%.*s'", t->len, t->loc);
+  return NULL;
+}
+
 // declaration = declspec declarator ("=" expr)? ("," declarator ("=" expr)?)* ";"
 static Node *declaration(void) {
-  Type *base = declspec();
+  VarAttr attr = {0};
+  Type *base = declspec(&attr);
   Node head = {0};
   Node *cur = &head;
   bool first = true;
@@ -510,7 +861,15 @@ static Node *declaration(void) {
     first = false;
     char *name;
     Type *ty = declarator(base, &name);
+
+    // A typedef declares a name, not an object: register it and emit nothing.
+    if (attr.is_typedef) {
+      push_scope(name)->type_def = ty;
+      continue;
+    }
+
     if (ty->kind == TY_VOID) error_at(tk->loc, "variable declared void");
+    if (ty->size < 0) error_at(tk->loc, "variable has incomplete type");
     Obj *var = new_var(name, ty, true);
 
     if (consume("=")) {
@@ -603,20 +962,25 @@ static Node *primary(void) {
   }
 
   if (consume("sizeof")) {
-    // sizeof(type) vs sizeof expr. Peek for a typename after '('.
+    // sizeof(type) vs sizeof expr. Only a typename after '(' means the former,
+    // and "typename" now includes typedefs, so this needs the scope stack.
     if (peek("(")) {
       Token *save = tk;
       tk = tk->next;
       if (is_typename()) {
-        Type *ty = declspec();
+        Type *ty = declspec(NULL);
         while (consume("*")) ty = pointer_to(ty);
+        // Abstract array declarator: sizeof(int[4]).
+        while (peek("[")) ty = type_suffix(ty);
         expect(")");
+        if (ty->size < 0) error_at(tok->loc, "sizeof applied to an incomplete type");
         return new_num(ty->size, tok);
       }
       tk = save;
     }
     Node *n = unary();
     add_type(n);
+    if (n->ty->size < 0) error_at(tok->loc, "sizeof applied to an incomplete type");
     return new_num(n->ty->size, tok);
   }
 
@@ -635,9 +999,13 @@ static Node *primary(void) {
   if (tk->kind == TK_IDENT) {
     char *name = get_ident();
     if (consume("(")) return funcall(name, tok);
-    Obj *v = find_var(tok);
-    if (!v) error_at(tok->loc, "undefined variable '%s'", name);
-    return new_var_node(v, tok);
+
+    VarScope *vs = find_name(tok);
+    if (!vs) error_at(tok->loc, "undefined identifier '%s'", name);
+    // An enum constant is just a number that happened to have a name.
+    if (vs->enum_ty) return new_num(vs->enum_val, tok);
+    if (!vs->var) error_at(tok->loc, "'%s' is a type, not a value", name);
+    return new_var_node(vs->var, tok);
   }
 
   error_at(tk->loc, "expected an expression");
@@ -654,6 +1022,28 @@ static Node *postfix(void) {
       expect("]");
       n = new_unary(ND_DEREF, new_add(n, idx, tok), tok);
       add_type(n);
+      continue;
+    }
+    if (consume(".")) {
+      add_type(n);
+      if (!is_aggregate(n->ty)) error_at(tok->loc, "'.' applied to something that is not a struct or union");
+      Node *m = new_unary(ND_MEMBER, n, tok);
+      m->member = get_member(n->ty, tk);
+      tk = tk->next;
+      m->ty = m->member->ty;
+      n = m;
+      continue;
+    }
+    if (consume("->")) {
+      // x->y is exactly (*x).y, so build it that way instead of duplicating.
+      n = new_unary(ND_DEREF, n, tok);
+      add_type(n);
+      if (!is_aggregate(n->ty)) error_at(tok->loc, "'->' applied to something that is not a pointer to struct or union");
+      Node *m = new_unary(ND_MEMBER, n, tok);
+      m->member = get_member(n->ty, tk);
+      tk = tk->next;
+      m->ty = m->member->ty;
+      n = m;
       continue;
     }
     if (consume("++") || consume("--")) {
@@ -862,6 +1252,9 @@ static Node *stmt(void) {
   if (consume("for")) {
     Node *n = new_node(ND_FOR, tok);
     expect("(");
+    // "for (int i = 0; ...)" declares i in a scope of its own, so the next loop
+    // in the same block can declare i again.
+    enter_scope();
     char *sb = brk_label, *sc = cont_label;
     brk_label = cont_label = NULL;   // assigned in codegen
 
@@ -873,6 +1266,7 @@ static Node *stmt(void) {
     expect(")");
     n->then = stmt();
 
+    leave_scope();
     brk_label = sb; cont_label = sc;
     return n;
   }
@@ -905,10 +1299,16 @@ static Node *compound_stmt(void) {
   Token *tok = tk;
   Node head = {0};
   Node *cur = &head;
-  // shortcut: one flat scope per function, not per block. Shadowing in an
-  // inner block resolves to the outer variable. Fix when self-hosting needs it.
-  while (!consume("}"))
+
+  enter_scope();
+  while (!consume("}")) {
+    // An identifier is a declaration only if it names a typedef in scope, so
+    // this test depends on the scope stack rather than on the token alone.
     cur = cur->next = is_typename() ? declaration() : stmt();
+    add_type(cur);
+  }
+  leave_scope();
+
   Node *n = new_node(ND_BLOCK, tok);
   n->body = head.next;
   return n;
@@ -942,7 +1342,7 @@ static Obj *function(Type *base) {
     if (!pfirst) expect(",");
     pfirst = false;
     if (consume("...")) { expect(")"); break; }   // varargs: callee ignores them
-    Type *pbase = declspec();
+    Type *pbase = declspec(NULL);
     char *pname;
     Type *pty = declarator(pbase, &pname);
     if (pty->kind == TY_ARRAY) pty = pointer_to(pty->base);   // arrays decay
@@ -951,6 +1351,14 @@ static Obj *function(Type *base) {
     pcur = pcur->next = p;
   }
 
+  for (Obj *p = phead.next; p; p = p->next)
+    if (is_aggregate(p->ty))
+      error_at(tk->loc, "passing a struct or union by value is not supported yet "
+                        "(needs SysV eightbyte classification; see PLAN.md)");
+  if (is_aggregate(ty))
+    error_at(tk->loc, "returning a struct or union by value is not supported yet "
+                      "(needs SysV eightbyte classification; see PLAN.md)");
+
   Obj *fn = calloc(1, sizeof(Obj));
   fn->name = name;
   fn->ty = func_returning(ty);
@@ -958,15 +1366,23 @@ static Obj *function(Type *base) {
   fn->next = globals;
   globals = fn;
 
+  // Parameters and body share one scope, so a parameter can be shadowed by a
+  // declaration in an inner block but not by one at the top level of the body.
+  enter_scope();
   create_param_vars(phead.next);
   fn->params = locals;
 
-  if (consume(";")) { fn->is_definition = false; return fn; }   // prototype
+  if (consume(";")) {           // prototype
+    leave_scope();
+    fn->is_definition = false;
+    return fn;
+  }
 
   expect("{");
   fn->is_definition = true;
   fn->body = compound_stmt();
   fn->locals = locals;
+  leave_scope();
 
   int off = 0;
   for (Obj *v = fn->locals; v; v = v->next) {
@@ -978,13 +1394,15 @@ static Obj *function(Type *base) {
   return fn;
 }
 
-static void global_variable(Type *base) {
+static void global_variable(Type *base, VarAttr *attr) {
   bool first = true;
   while (!consume(";")) {
     if (!first) expect(",");
     first = false;
     char *name;
     Type *ty = declarator(base, &name);
+    if (attr && attr->is_typedef) { push_scope(name)->type_def = ty; continue; }
+    if (ty->size < 0) error_at(tk->loc, "global has incomplete type");
     new_var(name, ty, false);
   }
 }
@@ -1005,9 +1423,14 @@ static Obj *parse(Token *t) {
   tk = t;
   globals = NULL;
   while (tk->kind != TK_EOF) {
-    Type *base = declspec();
-    if (is_function_decl()) function(base);
-    else global_variable(base);
+    VarAttr attr = {0};
+    Type *base = declspec(&attr);
+
+    // "struct foo { ... };" declares a tag and nothing else.
+    if (consume(";")) continue;
+
+    if (!attr.is_typedef && is_function_decl()) function(base);
+    else global_variable(base, &attr);
   }
   return globals;
 }
@@ -1050,6 +1473,10 @@ static void gen_addr(Node *n) {
   case ND_DEREF:
     gen_expr(n->lhs);
     return;
+  case ND_MEMBER:
+    gen_addr(n->lhs);
+    if (n->member->offset) emit("add $%d, %%rax", n->member->offset);
+    return;
   case ND_COMMA:
     gen_expr(n->lhs);
     gen_addr(n->rhs);
@@ -1061,9 +1488,13 @@ static void gen_addr(Node *n) {
 
 // rax holds an address; replace it with the value at that address.
 static void load(Type *ty) {
-  if (ty->kind == TY_ARRAY) return;        // arrays evaluate to their address
-  if (ty->size == 1)      emit("movsbl (%%rax), %%eax");
-  else if (ty->size == 2) emit("movswl (%%rax), %%eax");
+  // An array or an aggregate has no loadable value: the address *is* the value.
+  if (is_address_valued(ty)) return;
+
+  // Narrow loads must widen with the right sign, or a char holding 0xFF reads
+  // as 255 where it should read as -1 (or the reverse for unsigned char).
+  if (ty->size == 1)      emit(ty->is_unsigned ? "movzbl (%%rax), %%eax" : "movsbl (%%rax), %%eax");
+  else if (ty->size == 2) emit(ty->is_unsigned ? "movzwl (%%rax), %%eax" : "movswl (%%rax), %%eax");
   else if (ty->size == 4) emit("movl (%%rax), %%eax");
   else                    emit("mov (%%rax), %%rax");
 }
@@ -1071,6 +1502,19 @@ static void load(Type *ty) {
 // Stack holds the destination address; rax holds the value.
 static void store(Type *ty) {
   pop("%rdi");
+
+  if (is_aggregate(ty)) {
+    // rax holds the source address, rdi the destination. Copy byte by byte.
+    // shortcut: unrolled, so a 4KB struct emits 8K instructions. Switch to a
+    // rep movsb or a loop once anything in t/ has a struct big enough to care.
+    for (int i = 0; i < ty->size; i++) {
+      emit("mov %d(%%rax), %%r8b", i);
+      emit("mov %%r8b, %d(%%rdi)", i);
+    }
+    emit("mov %%rdi, %%rax");       // the assignment's value is the destination
+    return;
+  }
+
   if (ty->size == 1)      emit("mov %%al, (%%rdi)");
   else if (ty->size == 2) emit("mov %%ax, (%%rdi)");
   else if (ty->size == 4) emit("mov %%eax, (%%rdi)");
@@ -1104,6 +1548,12 @@ static void gen_expr(Node *n) {
     return;
   case ND_DEREF:
     gen_expr(n->lhs);
+    load(n->ty);
+    return;
+  case ND_MEMBER:
+    // Reading a member is addressing it and then loading. Without this case it
+    // falls through to the binary-operator path and dereferences a NULL rhs.
+    gen_addr(n);
     load(n->ty);
     return;
   case ND_CAST:
@@ -1204,6 +1654,8 @@ static void gen_expr(Node *n) {
   bool wide = (n->lhs->ty->size == 8 || n->rhs->ty->size == 8 || is_pointer(n->lhs->ty));
   char *ax = wide ? "%rax" : "%eax";
   char *di = wide ? "%rdi" : "%edi";
+  // Signedness decides div vs idiv and setb vs setl. Pointers compare unsigned.
+  bool uns = n->lhs->ty->is_unsigned || is_pointer(n->lhs->ty);
 
   switch (n->kind) {
   case ND_ADD: emit("add %s, %s", di, ax); return;
@@ -1211,7 +1663,12 @@ static void gen_expr(Node *n) {
   case ND_MUL: emit("imul %s, %s", di, ax); return;
   case ND_DIV:
   case ND_MOD:
-    if (wide) {
+    if (uns) {
+      // Unsigned division zeroes the high half rather than sign-extending it.
+      if (wide) { emit("mov $0, %%rdx"); emit("div %%rdi"); }
+      else      { emit("mov $0, %%edx"); emit("div %%edi"); }
+      if (n->kind == ND_MOD) emit("mov %%rdx, %%rax");
+    } else if (wide) {
       emit("cqo"); emit("idiv %%rdi");
       if (n->kind == ND_MOD) emit("mov %%rdx, %%rax");
     } else {
@@ -1225,13 +1682,16 @@ static void gen_expr(Node *n) {
   case ND_BITOR:  emit("or %s, %s", di, ax); return;
   case ND_BITXOR: emit("xor %s, %s", di, ax); return;
   case ND_SHL:    emit("mov %%rdi, %%rcx"); emit("shl %%cl, %s", ax); return;
-  case ND_SHR:    emit("mov %%rdi, %%rcx"); emit("sar %%cl, %s", ax); return;
+  case ND_SHR:
+    emit("mov %%rdi, %%rcx");
+    emit(uns ? "shr %%cl, %s" : "sar %%cl, %s", ax);
+    return;
   case ND_EQ: case ND_NE: case ND_LT: case ND_LE:
     emit("cmp %s, %s", di, ax);
     if (n->kind == ND_EQ)      emit("sete %%al");
     else if (n->kind == ND_NE) emit("setne %%al");
-    else if (n->kind == ND_LT) emit("setl %%al");
-    else                       emit("setle %%al");
+    else if (n->kind == ND_LT) emit(uns ? "setb %%al"  : "setl %%al");
+    else                       emit(uns ? "setbe %%al" : "setle %%al");
     emit("movzb %%al, %%rax");
     return;
   default:
