@@ -3,20 +3,27 @@
 # Exit status is the oracle because it needs no I/O and no libc.
 cd "$(dirname "$0")/.." || exit 1
 
+# Scratch paths carry the pid. They were fixed names, so two runs of this
+# suite at once compiled over each other's t/tmp.c and then ran whichever
+# binary won -- reporting failures that belong to neither run. Hit for real:
+# two instances of .portfolio/extract.py overlapped and this suite reported
+# FAILING while passing 168 of 168 on its own.
+T=t/tmp.$$
+
 pass=0
 fail=0
 
 check() {
   expected="$1"
   src="$2"
-  printf '%s' "$src" > t/tmp.c
-  if ! ./cc t/tmp.c -o t/tmp 2> t/tmp.err; then
+  printf '%s' "$src" > "$T.c"
+  if ! ./cc "$T.c" -o "$T.bin" 2> "$T.err"; then
     fail=$((fail + 1))
     printf 'FAIL (compile) %s\n' "$src"
-    sed 's/^/        /' t/tmp.err
+    sed 's/^/        /' "$T.err"
     return
   fi
-  ./t/tmp
+  "./$T.bin"
   got=$?
   if [ "$got" = "$expected" ]; then
     pass=$((pass + 1))
@@ -228,5 +235,5 @@ check 1   'int main() { char *p = "hi"; return p[0] == 104; }'
 check 15  'int main() { int a[3] = {1,2,3}; int s=0; int i; for(i=0;i<3;i=i+1) s=s+a[i]; int b[2]={4,5}; s=s+b[0]+b[1]; return s; }'
 #__APPEND_BELOW__
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
-rm -f t/tmp.c t/tmp t/tmp.err
+rm -f "$T.c" "$T.bin" "$T.err"
 [ "$fail" = 0 ]
