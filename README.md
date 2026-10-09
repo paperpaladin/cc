@@ -88,7 +88,7 @@ Three deliberate corners, each marked `shortcut:` in the source with its
 ceiling:
 
 - **Stack-machine codegen, no register allocator.** Every binary operator
-  pushes and pops. The output is roughly 3× the instructions a real compiler
+  pushes and pops. The output is roughly 3x the instructions a real compiler
   emits. Worth fixing only once self-hosting is green and compile time matters.
 - **Nothing is freed.** A compiler is a short-lived process; `exit` reclaims.
 - **`gcc` assembles and links.** Writing an assembler is a different project.
