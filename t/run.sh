@@ -38,6 +38,13 @@ check() {
   fi
 }
 
+# A case whose source spans more than one line. t/differential.sh pulls cases
+# out of this file with `grep '^check '`, one line at a time, so a multi-line
+# check would reach it as an unterminated quote and break the whole run. The
+# name is what keeps them apart, and anything needing a #include has to use
+# this one, because a directive owns its line.
+check_src() { check "$@"; }
+
 # A program cc must refuse. gcc has to refuse it too, because "cc rejects
 # this" is an opinion until something outside this repo agrees: a compiler that
 # invents its own errors is as broken as one that misses real ones, and only
@@ -481,9 +488,9 @@ check 0   'int lg(char *b, char *f, ...){ va_list ap; va_start(ap,f); int n=vspr
 # --- line splicing and specifier order
 # Translation phase 2: a backslash before a newline joins the lines, before
 # anything is a token. Real headers are full of it.
-check 0   'int main(){ int x = 3 + \
+check_src 0   'int main(){ int x = 3 + \
 4; return x - 7; }'
-check 0   'int main(){ int ab\
+check_src 0   'int main(){ int ab\
 c = 5; return abc - 5; }'
 
 # The specifiers of a declaration may appear in any order. glibc's stddef.h
@@ -501,8 +508,56 @@ refuse 'int main(){ void int x; return 0; }'
 # A real system header, compiled and run. This is the stronger form of the
 # question t/cpp.sh can only half-ask: not just whether the header comes out
 # whole, but whether what comes out is a program.
-check 8   '#include <stddef.h>
+check_src 8   '#include <stddef.h>
 int main(void){ size_t n = 8; ptrdiff_t d = 2; return n - d*0; }'
+
+# --- bitfields (PLAN 12)
+# Layout first: every one of these is a number gcc also produces, and the
+# packing rules are where a bitfield implementation is usually wrong.
+check 4   'struct S{int a:3;int b:5;int c:24;}; int main(){return sizeof(struct S);}'
+check 8   'struct S{int a:30;int b:10;}; int main(){return sizeof(struct S);}'
+# A field that will not fit whole in the open unit starts a new one rather
+# than straddling the boundary. The size is 8 either way, so only reading
+# the value back can tell: a straddled b lives at bit 30 of a four-byte unit
+# and its top bits are simply not in the word that gets loaded.
+check 11  'struct S{int a:30;int b:10;}; int main(){struct S s; s.a=5; s.b=300; return (s.b==300)*10+(s.a==5);}'
+check 8   'struct S{int a:3;int :0;int b:3;}; int main(){return sizeof(struct S);}'
+check 4   'struct S{int a:3;int :5;int b:3;}; int main(){return sizeof(struct S);}'
+check 16  'struct S{char c;int a:5;long l;}; int main(){return sizeof(struct S);}'
+check 1   'struct S{unsigned char a:2;unsigned char b:2;}; int main(){return sizeof(struct S);}'
+
+# A signed field narrower than its type sign-extends on the way out, so
+# storing 7 into three bits reads back as -1.
+check 1   'struct S{int a:3;}; int main(){struct S s; s.a=7; return s.a==-1;}'
+check 7   'struct S{unsigned a:3;}; int main(){struct S s; s.a=7; return s.a;}'
+check 1   'struct S{int a:3;}; int main(){struct S s; int v=(s.a=7); return v==-1;}'
+
+# A store is read-modify-write, so the neighbours sharing the unit survive.
+check 1   'struct S{int a:4;int b:4;}; int main(){struct S s; s.a=5;s.b=6;s.a=3; return s.b==6;}'
+check 11  'struct S{int a:3;int b:5;}; int main(){struct S s; s.a=2;s.b=9; return s.a+s.b;}'
+check 1   'struct S{unsigned a:32;}; int main(){struct S s; s.a=4294967295u; return s.a==4294967295u;}'
+check 1   'struct S{unsigned long a:64;}; int main(){struct S s; s.a=-1; return s.a==-1;}'
+check 1   'struct S{int a:4;int b:4;int c;}; int main(){struct S s; s.c=9; s.a=1; return s.c==9;}'
+
+refuse 'struct S{int a:40;}; int main(){return 0;}'
+refuse 'struct S{int a:3;}; int main(){struct S s; return 0;} int x:3;'
+
+# --- type qualifiers, parsed and ignored
+check 5   'int main(){ const int x = 5; return x; }'
+check 5   'int main(){ volatile int x = 5; return x; }'
+check 97  'int f(const char *restrict s){ return s[0]; } int main(){ return f("abc"); }'
+check 8   'int main(){ char * const p = "x"; return sizeof(p); }'
+
+# A 64-bit literal must survive the tokenizer. strtol saturates at LONG_MAX,
+# so this one used to come out as 9223372036854775807.
+check 1   'int main(){ unsigned long x = 18446744073709551615UL; return x == -1; }'
+check 1   'int main(){ return 0xFFFFFFFFFFFFFFFF == -1; }'
+
+# Real headers, compiled and run. These stopped at bitfields before.
+check_src 3   '#include <string.h>
+int main(void){ return strlen("abc"); }'
+check_src 1   '#include <ctype.h>
+int main(void){ return isdigit(53) != 0; }'
 
 #__APPEND_BELOW__
 

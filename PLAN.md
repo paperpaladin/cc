@@ -266,9 +266,38 @@ initialisers, and variadic definitions for the error helpers.
             struct rather than an array of one -- indistinguishable here
             because every aggregate is already address-valued, and it stops
             being indistinguishable at item 13).
-- [ ] 12 bitfields
+- [x] 12 bitfields
       why: `sqlite3.c` uses them, and they are the largest typical `c-testsuite`
-           failure cluster
+           failure cluster. More immediately: every remaining system header
+           stopped on `struct _IO_FILE`.
+      done: layout packs into storage units, `:0` breaks one, unnamed fields
+            are padding, and a field that will not fit whole in the open unit
+            starts a new one rather than straddling. Reading shifts the field
+            to the top of the register and arithmetic-shifts it back, which
+            is what sign-extends an odd width for free. Writing is
+            read-modify-write, and the value of the assignment is the field
+            as it reads back, not the value offered.
+      proves: 7 planted defects, 7 caught -- after one of them forced a
+            better case. "fields always share a unit" survived at first
+            because the only test was sizeof, and a straddled field gives
+            the same size; it takes reading the value back to see that the
+            top bits of a field at bit 30 of a four-byte unit are not in the
+            word that gets loaded.
+      found: two bugs in new code that the suite alone would not have caught.
+            A 32-bit-wide field's mask does not fit in an AND immediate, and
+            GAS promotes `mov $imm64` to movabs while silently having no
+            such escape for `and`. And `mask << offset` with an all-ones
+            signed mask is undefined; `make test-asan`, added two commits
+            ago, reported it on the first 64-bit field anyone wrote.
+- [x] 12b type qualifiers, and a 64-bit literal
+      done: const, volatile, restrict, __restrict, inline and _Noreturn parse
+            and are ignored, in declspec and after every `*`. There is no
+            const-checking here and the README says so rather than implying
+            otherwise. <string.h> and <ctype.h> compile and run as a result.
+            Number literals went through strtol, which saturates at LONG_MAX,
+            so 18446744073709551615 silently became 9223372036854775807.
+            strtoul: a literal is never negative here, since unary minus is
+            its own node.
 - [ ] 13 struct arguments and returns -- the SysV eightbyte classification
       why: the nastiest part of the ABI. Currently rejected with an explicit
            error rather than miscompiled, which is the right interim answer.

@@ -58,6 +58,14 @@ grep '^check ' t/run.sh > t/cases.sh
 . ./t/cases.sh
 rm -f t/cases.sh
 
+# Cases whose source spans more than one line are written as check_src and
+# are invisible to the line-at-a-time extraction above. Counting them here
+# rather than leaving them out quietly: a harness that covers less than it
+# appears to is the failure mode this project keeps running into, and the
+# number is cheap to print.
+notrun=$(grep -c '^check_src ' t/run.sh)
+
 printf '%d agree with gcc+clang, %d disagree, %d skipped\n' "$pass" "$fail" "$skip"
+printf '%d multi-line case(s) in t/run.sh are not differential-tested\n' "$notrun"
 rm -f t/dt.c t/dt.bin t/dt.err t/ref.bin
 [ "$fail" = 0 ]
