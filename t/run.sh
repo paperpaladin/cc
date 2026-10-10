@@ -558,6 +558,12 @@ check_src 3   '#include <string.h>
 int main(void){ return strlen("abc"); }'
 check_src 1   '#include <ctype.h>
 int main(void){ return isdigit(53) != 0; }'
+check_src 8   '#include <stdint.h>
+int main(void){ int64_t v = 8; uint8_t b = 255; return v + b - 255; }'
+check_src 8   '#include <limits.h>
+int main(void){ return CHAR_BIT; }'
+check_src 1   '#include <stdbool.h>
+int main(void){ bool b = true; return b; }'
 
 #__APPEND_BELOW__
 

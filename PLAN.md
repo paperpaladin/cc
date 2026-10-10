@@ -307,6 +307,21 @@ initialisers, and variadic definitions for the error helpers.
 - [ ] 15 **self-host**: `cmp cc2 cc3` in CI
       proves: the fixpoint invariant, from here to the end of the project
 
+- [x] 12c #include_next, and the compiler's answers about its own types
+      done: gcc's limits.h reaches glibc's by #include_next -- two files of
+            the same name in different directories, each pulling in the
+            other -- so a file records which search path found it and the
+            next search resumes after that. Searching from the start finds
+            the same file again and recurses.
+            gcc's stdint-gcc.h asks the compiler what its integer types are
+            called instead of hardcoding them, so the __INT_LEAST8_TYPE__
+            family and friends are predefined with the LP64 answers.
+      state: <stddef.h> <stdarg.h> <string.h> <ctype.h> <stdint.h>
+            <limits.h> <stdbool.h> all compile from /usr/include and run.
+            <stdio.h> stops at a function typedef and <stdlib.h> at
+            "typedef float _Float32", which is the first time the no-float
+            decision has actually cost anything.
+
 ### Milestone 2 -- external conformance
 
 - [ ] 16 `c-testsuite` runner, publishing the pass rate with the failures named
