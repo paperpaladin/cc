@@ -22,21 +22,63 @@
 
 // ---------------------------------------------------------------- diagnostics
 
-static char *src_name;
-static char *src_text;
+// A translation unit is no longer one buffer. #include means any token can
+// belong to any file that has been read, and the error reporter has to know
+// which one.
+typedef struct File File;
+struct File {
+  char *name;
+  char *text;
+  size_t len;
+  File *next;
+};
+static File *files;   // every file read so far, newest first
+
+static char *read_file(char *path);
+
+static File *new_file(char *name, char *text) {
+  File *f = calloc(1, sizeof(File));
+  f->name = name;
+  f->text = text;
+  f->len  = strlen(text);
+  f->next = files;
+  files = f;
+  return f;
+}
+
+// Error locations arrive as a bare char* from 56 call sites, from before
+// there was more than one file. Rather than thread a File through all of
+// them, find the owner by range: the pointer came from some file's text, and
+// the buffers do not overlap.
+static File *file_of(char *loc) {
+  for (File *f = files; f; f = f->next)
+    if (f->text <= loc && loc <= f->text + f->len) return f;
+  return NULL;
+}
 
 static void verror_at(char *loc, char *fmt, va_list ap) {
+  File *src = file_of(loc);
+  if (!src) {
+    // A token the preprocessor synthesised (## paste, # stringify) points at
+    // no file. Reporting a caret into someone else's buffer would be worse
+    // than reporting no caret at all.
+    fprintf(stderr, "cc: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    exit(1);
+  }
+
   // Find the line containing loc.
   char *line = loc;
-  while (src_text < line && line[-1] != '\n') line--;
+  while (src->text < line && line[-1] != '\n') line--;
   char *end = loc;
   while (*end && *end != '\n') end++;
 
   int lineno = 1;
-  for (char *p = src_text; p < line; p++)
+  for (char *p = src->text; p < line; p++)
     if (*p == '\n') lineno++;
 
-  int indent = fprintf(stderr, "%s:%d: ", src_name, lineno);
+  int indent = fprintf(stderr, "%s:%d: ", src->name, lineno);
   fprintf(stderr, "%.*s\n", (int)(end - line), line);
   fprintf(stderr, "%*s^ ", indent + (int)(loc - line), "");
   vfprintf(stderr, fmt, ap);
@@ -62,23 +104,47 @@ static void error(char *fmt, ...) {
 typedef enum { TK_IDENT, TK_PUNCT, TK_KEYWORD, TK_NUM, TK_STR, TK_EOF } TokenKind;
 
 typedef struct Token Token;
+typedef struct HideSet HideSet;
+
 struct Token {
   TokenKind kind;
   Token *next;
   long val;      // TK_NUM
-  char *loc;     // position in src_text
+  char *loc;     // position inside file->text
   int len;
   char *str;     // TK_STR contents (NUL-terminated)
   int str_len;   // including the terminating NUL
+
+  // Provenance. The preprocessor is line-oriented and the parser is not, so
+  // these are set by the tokenizer and consumed before parsing begins.
+  File *file;
+  int line;
+  bool at_bol;     // first token on its line: only here can a '#' be a directive
+  bool has_space;  // whitespace preceded it, which '#' stringification must preserve
+  HideSet *hide;   // macros this token may not be re-expanded by
 };
+
+// Tokenizer position, consumed by new_token. These are tokenizer state rather
+// than parameters because new_token has 20-odd call sites in tokenize().
+static File *tk_file;
+static int  tk_line;
+static bool tk_bol;
+static bool tk_space;
 
 static Token *new_token(TokenKind kind, char *start, char *end) {
   Token *t = calloc(1, sizeof(Token));
   t->kind = kind;
   t->loc = start;
   t->len = end - start;
+  t->file = tk_file;
+  t->line = tk_line;
+  t->at_bol = tk_bol;
+  t->has_space = tk_space;
+  tk_bol = false;
+  tk_space = false;
   return t;
 }
+
 
 static bool tok_is(Token *t, char *s) {
   return t->len == (int)strlen(s) && !memcmp(t->loc, s, t->len);
@@ -155,22 +221,33 @@ static int read_char(char **pp) {
   }
 }
 
-static Token *tokenize(void) {
-  char *p = src_text;
+static Token *tokenize(File *file) {
+  char *p = file->text;
   Token head = {0};
   Token *cur = &head;
 
+  tk_file = file;
+  tk_line = 1;
+  tk_bol = true;
+  tk_space = false;
+
   while (*p) {
-    if (isspace((unsigned char)*p)) { p++; continue; }
+    // A newline is not just whitespace here. It ends a directive and it is
+    // what makes the next '#' a directive rather than an operator.
+    if (*p == '\n') { p++; tk_line++; tk_bol = true; tk_space = false; continue; }
+    if (isspace((unsigned char)*p)) { p++; tk_space = true; continue; }
 
     if (starts_with(p, "//")) {
       while (*p && *p != '\n') p++;
+      tk_space = true;
       continue;
     }
     if (starts_with(p, "/*")) {
       char *q = strstr(p + 2, "*/");
       if (!q) error_at(p, "unterminated block comment");
+      for (char *s = p; s < q; s++) if (*s == '\n') tk_line++;
       p = q + 2;
+      tk_space = true;  // a comment is whitespace, and may not join two tokens
       continue;
     }
 
@@ -216,7 +293,6 @@ static Token *tokenize(void) {
       char *start = p;
       while (is_ident2(*p)) p++;
       cur = cur->next = new_token(TK_IDENT, start, p);
-      if (is_keyword(cur)) cur->kind = TK_KEYWORD;
       continue;
     }
 
@@ -230,8 +306,17 @@ static Token *tokenize(void) {
     error_at(p, "invalid character '%c'", *p);
   }
 
+  tk_bol = true;
   cur->next = new_token(TK_EOF, p, p);
   return head.next;
+}
+
+// Deferred out of tokenize(). Until the preprocessor has run, "int" might be
+// a macro parameter and a macro might expand to "return"; deciding keyword-ness
+// at tokenize time would freeze the wrong answer in both directions.
+static void convert_keywords(Token *t) {
+  for (; t && t->kind != TK_EOF; t = t->next)
+    if (t->kind == TK_IDENT && is_keyword(t)) t->kind = TK_KEYWORD;
 }
 
 // ----------------------------------------------------------------- type system
@@ -2212,10 +2297,10 @@ int main(int argc, char **argv) {
   }
   if (!input) usage(1);
 
-  src_name = input;
-  src_text = read_file(input);
+  File *f = new_file(input, read_file(input));
 
-  Token *t = tokenize();
+  Token *t = tokenize(f);
+  convert_keywords(t);
   Obj *prog = parse(t);
 
   char *asm_path;
