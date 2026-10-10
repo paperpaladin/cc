@@ -341,9 +341,33 @@ against planted defects rather than assumed to work:
 
 | planted defect | seeds that caught it |
 |---|---|
-| unsigned division emitted as signed | 26 of 100 |
-| shift count taken from the wrong place | 13 of 100 |
 | `xor` emitted as `or` | 44 of 100 |
+| unsigned division emitted as signed | 26 of 100 |
+| a narrow parameter stored at full width | 25 of 100 |
+| a struct passed in one register instead of two | 18 of 100 |
+| a signed `char` loaded with `movzbl` | 11 of 100 |
+| shift count taken from the wrong place | 13 of 100 |
+| an argument not converted at the call | 5 of 100 |
+
+Three of those numbers started at zero, and fixing them is most of what
+this generator is:
+
+**Generating a construct is not exercising it.** The first version emitted
+structs and narrow types, then threw most of their values away -- a wrong
+answer was computed and never reached the exit status. Every construct now
+folds into a running accumulator, which took "struct passed in one
+register" from 1 of 100 to 18.
+
+**A signed type needs negative values.** Narrow variables were masked to
+0..127, so the sign bit was never set and a signed load was
+indistinguishable from an unsigned one: 0 of 100. They now land in -64..63,
+which still keeps `a*b` inside an int.
+
+**Narrowing cannot test a conversion at the call.** Passing a wide value to
+a narrow parameter is right either way, because the callee truncates into
+its own slot -- the same vacuity as `g(300)` further down this file. Only
+widening can see it, so every narrow variable is also passed to a function
+taking `long`.
 
 ### Checking a type, not just a number
 

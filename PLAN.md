@@ -530,9 +530,23 @@ the whole suite.
             proves nothing.
             Seeds where gcc and clang disagree are skipped AND counted, so
             the denominator cannot shrink quietly.
-      proves: 3 planted defects in codegen, caught by 26, 13 and 44 of 100
-            seeds. A fuzzer that has never been watched to fail is a
+      proves: 7 planted defects in codegen, caught by between 5 and 44 of
+            100 seeds. A fuzzer that has never been watched to fail is a
             fuzzer that always passes.
+            Three of those started at zero or one, and the reasons are the
+            substance of this item rather than incidental:
+            generating a construct is not exercising it -- structs and
+            narrow types were emitted and then their values discarded, so
+            every construct now folds into a running accumulator and
+            "struct in one register" went from 1 of 100 to 18;
+            a signed type needs negative values -- narrow variables were
+            masked to 0..127, so a signed load was indistinguishable from
+            an unsigned one at 0 of 100, and they now land in -64..63;
+            and narrowing cannot test a conversion at the call, because the
+            callee truncates into its own slot and is right either way, so
+            every narrow variable is also passed to a function taking long.
+            That last one is the same vacuity as g(300) in item 08, found
+            again in a different disguise.
       limit: it cannot find a signed-overflow bug, because it never
             generates signed overflow. Stated rather than left implied.
       found: two bugs in the generator itself on the first run, both caught
