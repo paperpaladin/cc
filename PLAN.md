@@ -168,8 +168,48 @@ initialisers, and variadic definitions for the error helpers.
             restored the linker folds the two g's into one and the answer
             changes from 12 to 22 -- in practice it fails earlier, at
             "multiple definition of g".
-- [ ] 10 global initialisers (`int x = 5;` at file scope, and string pointers)
+- [x] 10 global initialisers (`int x = 5;` at file scope, and string pointers)
       why: currently every global is `.zero`-filled
+      done: a byte buffer plus a sorted relocation list. An address cannot be
+            a byte pattern, so "char *p = \"abc\"" is eight zero bytes and an
+            instruction for the linker; eval_addr() is eval() extended to
+            return label+addend for the forms a linker can resolve.
+            Covers scalars, arrays, nested arrays, structs, strings into char
+            arrays, &global, array decay, and pointer+offset -- which is the
+            whole of what cc.c's own KEYWORDS and PUNCT tables need.
+            Sections split properly now: .bss for uninitialised, .data for
+            initialised, .rodata for string literals.
+            Unsized arrays had to learn their length before the incomplete
+            type check rather than after it, in both the global and the
+            static-local path.
+      found: "extern int e = 1;" was being refused. gcc accepts it and gcc is
+            right -- C11 6.9.2 says a file-scope declaration with an
+            initialiser IS a definition. This is the first thing refuse()
+            caught in cc rather than in a test, which is the entire argument
+            for making a refusal require an outside authority to agree.
+      proves: 6 planted defects. 4 caught by `make test`, 1 more only by
+            `make test-asan` (see below), 1 left alive on purpose.
+- [x] 10b `make test-asan`
+      why: ten sibling repos gate on sanitizers and this one did not, which
+           is backwards -- a compiler reads untrusted bytes for a living.
+      done: prompted by a surviving mutant. Dropping the string-copy clamp
+            makes `char s[3] = "hello"` a heap overflow inside the compiler,
+            and the plain suite scores 237 passed, because the bytes it
+            tramples are not ones any assertion reads. Under the sanitizer
+            the same case fails. t/run.sh and t/cpp.sh take CCBIN so the
+            cases are identical either way.
+            ASAN_OPTIONS=exitcode=86 is load-bearing: a sanitizer abort exits
+            1 and so does a correct refusal, so refuse() would have scored a
+            crash as a pass. That is inflate'"'"'s recorded bug, borrowed rather
+            than rediscovered.
+            detect_leaks=0 is deliberate. Nothing here is ever freed, by
+            design, so LeakSanitizer is correct on every run and 237 copies
+            of a known complaint is how output stops being read.
+      note: the surviving mutant is calloc -> malloc for the initialiser
+            buffer. Partial initialisation must zero the rest, and the suite
+            cannot tell, because nothing is freed and so every allocation is
+            a page the kernel already zeroed. Correct, required, untestable
+            from in here. Stated rather than hidden.
 - [ ] 11 variadic function definitions, `stdarg.h` against the real ABI
 - [ ] 12 bitfields
       why: `sqlite3.c` uses them, and they are the largest typical `c-testsuite`

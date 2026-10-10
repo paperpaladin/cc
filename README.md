@@ -63,6 +63,13 @@ uninitialised stack.
 **Calls** -- definitions and calls up to 6 arguments, recursion, and calls into
 libc that get the ABI right.
 
+**Global initialisers** -- scalars, arrays, nested arrays, structs, strings
+into `char` arrays, and addresses: `char *p = "abc"`, `int *p = &v`, `int *p
+= a + 2`, and tables like `char *K[] = {"a","bb",0}`. An address is not a
+byte pattern, so those become relocations the linker fills in. Initialised
+`static` locals work too. Uninitialised globals go in `.bss`, initialised
+ones in `.data`, string literals in `.rodata`.
+
 **`static` and `extern`** -- internal linkage on globals and functions,
 `extern` declarations that reference another translation unit without
 defining anything, and `static` locals, which have block scope and static
@@ -183,9 +190,27 @@ the published torture tests for rescanning, `#`, `##` and variadic macros.
 
 ```
 $ make test
-168 passed, 0 failed
+237 passed, 0 failed
+56 passed, 0 failed
+
+$ make test-asan        # the same suite, watched
+237 passed, 0 failed
 56 passed, 0 failed
 ```
+
+`make test-asan` rebuilds the compiler with AddressSanitizer and
+UndefinedBehaviorSanitizer and runs everything again. Two settings in that
+target are load-bearing rather than tidy:
+
+`ASAN_OPTIONS=exitcode=86`, because a sanitizer abort exits 1 and so does a
+correct refusal. Without separating them, `refuse()` scores a crash as a
+pass and the entire sanitizer build quietly stops meaning anything. That
+exact collision is a bug already recorded in a sibling project, so it was
+cheaper to assume it than discover it.
+
+`detect_leaks=0`, because this compiler frees nothing on purpose and
+LeakSanitizer is right every single time it complains. 237 failures that all
+say the same known thing is the fastest way to stop reading output.
 
 ### Watching that suite fail
 
@@ -251,6 +276,30 @@ removed the promotion from the *left* operand while the test case had the
 narrow type on the *right*, so identical assembly came out and the mutant
 looked like it survived. A mutation test can be vacuous exactly like an
 ordinary one.
+
+### A mutant the plain suite cannot kill
+
+Global initialisers were mutation tested the same way, and one survivor is
+the reason `make test-asan` now exists. Removing the clamp here
+
+```c
+int n = t->str_len < ty->size ? t->str_len : ty->size;   // char s[3] = "hello"
+```
+
+turns `char s[3] = "hello"` into a six-byte write into a three-byte buffer.
+The ordinary suite scores it 237 passed: the bytes it tramples are not ones
+the output depends on, so the program still returns 57 and every assertion
+holds. Under the sanitizer build the same case is a heap-buffer-overflow and
+the mutant dies. A test that drives the code over the bug and checks the
+answer is not the same as a test that checks the bug did not happen.
+
+One mutant is left alive deliberately. Replacing `calloc` with `malloc` in
+the initialiser buffer should break partial initialisation -- `int a[4] =
+{1,2}` must zero the rest -- and does not, because this compiler never frees
+anything, so every allocation is a fresh page the kernel has already zeroed.
+The line is still correct and still required the moment any of that changes.
+Nothing in this suite can distinguish it, and saying so is better than
+pretending the coverage is complete.
 
 ## License
 
