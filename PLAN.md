@@ -210,7 +210,33 @@ initialisers, and variadic definitions for the error helpers.
             cannot tell, because nothing is freed and so every allocation is
             a page the kernel already zeroed. Correct, required, untestable
             from in here. Stated rather than hidden.
-- [ ] 11 variadic function definitions, `stdarg.h` against the real ABI
+- [x] 11 variadic function definitions, `stdarg.h` against the real ABI
+      done: the SysV register save area -- all six GP registers spilled on
+            entry to a known 48-byte block, because a variadic function has
+            to hand out arguments that arrived in registers and registers
+            are not addressable. Named parameters are therefore stored
+            twice, which is what the ABI asks for: the block must be a
+            contiguous image of the registers for va_arg to index.
+            va_list is built in the parser rather than read from a header,
+            since its layout is fixed by the ABI and the real <stdarg.h> is
+            GNU C from its first line. va_start, va_arg, va_end and va_copy
+            are predefined macros over __builtin_*, so a variadic function
+            needs no include at all.
+      oracle: glibc. vsprintf(buf, fmt, ap) hands our va_list to a library
+            compiled years ago by another compiler, which walks it with its
+            own va_arg. One field wrong and it reads memory that is not our
+            arguments. Nothing we could assert about our own structures is
+            worth as much.
+            And in the other direction: va_arg's overflow branch cannot be
+            reached by any program this compiler builds, because its call
+            path stops at six arguments. So gcc makes the call -- gcc
+            compiles a main that passes nine arguments to a variadic
+            function we compiled, and they are linked together. Their
+            convention, our prologue, our va_arg.
+      proves: 7 planted defects, 6 caught, 1 alive on purpose (va_list as a
+            struct rather than an array of one -- indistinguishable here
+            because every aggregate is already address-valued, and it stops
+            being indistinguishable at item 13).
 - [ ] 12 bitfields
       why: `sqlite3.c` uses them, and they are the largest typical `c-testsuite`
            failure cluster
