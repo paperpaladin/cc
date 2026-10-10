@@ -413,9 +413,37 @@ initialisers. That is the whole remaining distance to the fixpoint.
             gcc's -- because a passing convention can be self-consistently
             wrong, and only something that was not told what we decided can
             say otherwise.
-- [ ] 16 integer promotion done properly, rather than the current approximation
-      note: the relational half of this turned out to be a real bug and was
-            fixed early, as 08b. What is left is the arithmetic half.
+- [x] 16 integer promotion done properly, rather than the current approximation
+      note: the relational half turned out to be a real bug and was fixed
+            early, as 08b. This is the arithmetic half.
+      done: the type system and the code generator now share one rule. They
+            disagreed: add_type computed the result of an arithmetic
+            operation as "long if either side is long, else int" and
+            dropped unsignedness entirely, while codegen picked its
+            instruction from op_unsigned(). So "u - 1" on an unsigned u
+            produced exactly the right bits and then called itself an int,
+            and the comparison after it went signed. op_unsigned() moved up
+            out of codegen and arith_result() is built on it, so there is
+            one answer rather than two.
+            The conversions are now conversions. Computing only a result
+            type leaves a narrow operand to be widened by whatever the load
+            instruction happens to do, and a plain 32-bit load
+            zero-extends: "u + i" with an unsigned long and an int of -1
+            added 0x00000000FFFFFFFF rather than -1. Both operands are cast
+            to the result type in the tree.
+            Unary plus promotes. It was returning its operand untouched, so
+            sizeof(+a) on a short was 2.
+      proves: 368 generated expressions compared with gcc -- every operand
+            type against every integer operator, plus a separate shift
+            sweep because shifts are not symmetric and their count must
+            stay in range. Each one is checked on three things at once:
+            the sign of the result, whether it is zero, and its sizeof.
+            Checking only the value would miss a wrong type that computes
+            the right number, which is precisely the bug this item was.
+            5 planted defects, 5 caught -- but only after the shift sweep
+            was added. The mutation that stopped promoting a shift's left
+            operand survived everything else, because the matrix had no
+            shift operators in it.
 - [x] 17 **self-host**: `cmp cc2 cc3` in CI -- `make self-host`
       done: five bugs had to be fixed, and not one was found by looking.
             Three came from the compiler failing on its own source:
