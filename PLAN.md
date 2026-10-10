@@ -69,6 +69,35 @@ possible, because the fixpoint is worth more than any individual feature.
            codegen
       proves: inferred lengths, zero fill, 2D arrays, arrays of structs
 - [x] 06 t/addcase.sh -- expectations derived from gcc, cross-checked with clang
+- [x] 11b what self-hosting actually needs, found by trying it
+      why: the remaining list was planned, not measured. Pointing cc at its
+           own source and at /usr/include says which items are real.
+      done: three gaps the plan did not have.
+            Line splicing (phase 2) was simply missing. A backslash before a
+            newline joins the lines before anything is a token, which is why
+            it can cut an identifier in half; glibc uses it constantly.
+            declspec parsed specifiers positionally, so "unsigned long" worked
+            and "long unsigned int" did not -- and stddef.h writes the second.
+            Rewritten as a counter over the specifier multiset, which handles
+            every ordering and makes "long long" fall out rather than being a
+            case. Storage classes may now appear anywhere among them.
+            Default system include paths, so <...> resolves without -I.
+      state: <stddef.h> and <stdarg.h> compile and run. <string.h>, <stdio.h>,
+            <stdlib.h>, <ctype.h> and <stdint.h> all stop at the same place --
+            bitfields, item 12 -- and <limits.h> wants #include_next.
+      note: a real header cannot be diffed against gcc -E, and the reason is
+            structural rather than incidental: glibc branches on __GNUC__, so
+            gcc and this compiler are handed different source. gcc gets the
+            declarations with __attribute__ on them and we get the portable
+            ones, and both are right. The differential oracle stops meaning
+            anything the moment the input depends on which compiler is asking.
+            t/cpp.sh therefore only asks whether the header comes out whole,
+            and t/run.sh asks the stronger question by compiling and running
+            what came out.
+      bonus: not defining __GNUC__ turns out to be the useful choice rather
+            than a shortfall. It is what makes glibc hand us declarations
+            with no GNU extensions on them.
+
 ### Milestone 1 -- self-host
 
 Everything remaining is ordered by what `cc.c` itself uses. Nothing here is

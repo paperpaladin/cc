@@ -258,6 +258,40 @@ check 'include <> with -I' "$TMP/i2.c" "-I$TMP/inc"
 printf '#include "two.h"\nint x = FROM_ONE;\n' > "$TMP/i3.c"
 check 'nested include resolves relative to its own file' "$TMP/i3.c" "-I$TMP/inc"
 
+# ---- real system headers --------------------------------------------------
+# Not compared against gcc, and the reason is worth writing down: glibc's
+# headers branch on __GNUC__, so gcc and this compiler are not reading the
+# same source at all. gcc gets the GNU declarations with __attribute__ on
+# them, we get the portable ones, and both are correct. A differential oracle
+# stops meaning anything the moment the input depends on which compiler is
+# asking, so the question here is only "does it come out whole", and
+# t/run.sh asks the stronger one by compiling and running the result.
+real_header() {
+  name=$1; body=$2
+  printf '%s\n' "$body" > "$TMP/rh.c"
+  if "$CC" -E "$TMP/rh.c" > "$TMP/rh.i" 2> "$TMP/rh.err"; then
+    ok "$name (preprocesses, $(wc -l < "$TMP/rh.i") lines)"
+  else
+    nok "$name: $(head -1 "$TMP/rh.err")"
+  fi
+}
+real_header 'include <stddef.h>' '#include <stddef.h>
+size_t n;
+ptrdiff_t d;'
+real_header 'include <stdarg.h>' '#include <stdarg.h>
+int x;'
+
+# Line splicing is phase 2 and happens before anything is a token, which is
+# why it can cut an identifier in half and still work.
+case_ 'splice inside a macro body' '#define WIDE(a, \
+             b) ((a)+(b))
+WIDE(3,4)'
+case_ 'splice inside an identifier' 'int ab\
+c = 1;'
+case_ 'splice keeps later line numbers' 'int a \
+;
+int l = __LINE__;'
+
 # ---- the standard's own torture test --------------------------------------
 # C99 6.10.3.5 EXAMPLE 3. Every published preprocessor is expected to get this
 # exactly right, and it exercises rescanning, nested calls, ## and # together.

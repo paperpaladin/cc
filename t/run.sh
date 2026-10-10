@@ -478,6 +478,32 @@ check 1   'int f(int n, ...){ va_list ap; va_start(ap,n); char c = va_arg(ap,int
 # someone else'"'"'s memory rather than our arguments.
 check 0   'int lg(char *b, char *f, ...){ va_list ap; va_start(ap,f); int n=vsprintf(b,f,ap); va_end(ap); return n; } int main(){ char b[64]; int n=lg(b,"%d/%s/%c",42,"mid",65); if(n!=8) return 1; return strcmp(b,"42/mid/A"); }'
 
+# --- line splicing and specifier order
+# Translation phase 2: a backslash before a newline joins the lines, before
+# anything is a token. Real headers are full of it.
+check 0   'int main(){ int x = 3 + \
+4; return x - 7; }'
+check 0   'int main(){ int ab\
+c = 5; return abc - 5; }'
+
+# The specifiers of a declaration may appear in any order. glibc's stddef.h
+# writes "long unsigned int", which positional parsing never reaches.
+check 1   'int main(){ long unsigned int x = -1; return x > 5; }'
+check 1   'int main(){ unsigned long int x = -1; return x > 5; }'
+check 1   'int main(){ int unsigned long x = -1; return x > 5; }'
+check 1   'int main(){ signed char c = -1; return c == -1; }'
+check 44  'int main(){ short int s = 300; return s; }'
+check 8   'int main(){ long long x = 1; return sizeof(x); }'
+check 4   'int static x = 4; int main(){ return x; }'
+refuse 'int main(){ short long x; return 0; }'
+refuse 'int main(){ void int x; return 0; }'
+
+# A real system header, compiled and run. This is the stronger form of the
+# question t/cpp.sh can only half-ask: not just whether the header comes out
+# whole, but whether what comes out is a program.
+check 8   '#include <stddef.h>
+int main(void){ size_t n = 8; ptrdiff_t d = 2; return n - d*0; }'
+
 #__APPEND_BELOW__
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
