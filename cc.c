@@ -503,6 +503,18 @@ static bool op_unsigned(Type *a, Type *b) {
   return au || bu;
 }
 
+// Two scalar types that behave identically. Not pointer equality: a Type is
+// allocated fresh by pointer_to() and array_of(), so the same type can be
+// two objects.
+static bool same_scalar(Type *a, Type *b) {
+  if (a == b) return true;
+  if (a->kind != b->kind) return false;
+  if (a->size != b->size) return false;
+  if (a->is_unsigned != b->is_unsigned) return false;
+  return a->kind != TY_PTR && a->kind != TY_ARRAY && a->kind != TY_STRUCT &&
+         a->kind != TY_UNION && a->kind != TY_FUNC;
+}
+
 static bool is_address_valued(Type *t) {
   return t->kind == TY_ARRAY || t->kind == TY_FUNC || is_aggregate(t);
 }
@@ -1831,7 +1843,11 @@ static Node *funcall(char *name, Token *tok) {
       // have to match already -- and wrapping it in a cast turns the
       // argument into a non-lvalue, which is a problem because passing a
       // struct by value starts by taking its address.
-      if (!is_aggregate(param->ty)) arg = new_cast(arg, param->ty);
+      // Casting a value to the type it already has is a node that exists
+      // to do nothing, and it hides the operand from every later question
+      // about whether it is simple.
+      if (!is_aggregate(param->ty) && !same_scalar(arg->ty, param->ty))
+        arg = new_cast(arg, param->ty);
       param = param->next;
     } else if (fn && fn->has_proto && !fn->is_variadic) {
       error_at(atok->loc, "too many arguments to '%s'", name);
@@ -3960,6 +3976,37 @@ static void gen_cast(Type *from, Type *to) {
   else if (to->size == 4) emit("mov %%eax, %%eax");     // truncate to 32 bits
 }
 
+// A node that can be materialised in one instruction with no side effects
+// and no memory the left operand might have changed. A global is excluded
+// only because its address needs the symbol rather than an offset, and the
+// win is already most of what there is to take.
+static bool is_cheap_leaf(Node *n) {
+  if (n->kind == ND_NUM) return true;
+  if (n->kind != ND_VAR) return false;
+  if (!n->var->is_local) return false;
+  return !is_address_valued(n->ty) && n->ty->kind != TY_FLOAT && n->ty->kind != TY_DOUBLE;
+}
+
+// Materialise a leaf directly into one of the argument registers, in one
+// instruction. Staging through a fixed scratch register instead costs two
+// and, for a call, destroys the argument already sitting in the scratch.
+static char *ARGREG32_OF[] = {"%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"};
+
+static void load_leaf_into(Node *n, int reg) {
+  char *r64 = ARGREG64[reg], *r32 = ARGREG32_OF[reg];
+  if (n->kind == ND_NUM) {
+    emit("mov $%ld, %s", n->val, r64);
+    return;
+  }
+  Type *t = n->ty;
+  int off = n->var->offset;
+  // The same widening rules load() uses, into the chosen register.
+  if (t->size == 1)      emit(t->is_unsigned ? "movzbl %d(%%rbp), %s" : "movsbl %d(%%rbp), %s", off, r32);
+  else if (t->size == 2) emit(t->is_unsigned ? "movzwl %d(%%rbp), %s" : "movswl %d(%%rbp), %s", off, r32);
+  else if (t->size == 4) emit("movl %d(%%rbp), %s", off, r32);
+  else                   emit("mov %d(%%rbp), %s", off, r64);
+}
+
 static void gen_expr(Node *n) {
   switch (n->kind) {
   case ND_NUM:
@@ -4154,6 +4201,30 @@ static void gen_expr(Node *n) {
     // one or two. Eightbytes are pushed left to right in the order the
     // registers want them, so popping the whole run in reverse still lands
     // each one where it belongs.
+    // When every argument is a leaf, they can go straight into their
+    // registers: nothing between them can clobber anything, because a leaf
+    // neither calls nor reads memory that another leaf writes. That is the
+    // common shape -- f(x, 1) -- and it removes two instructions per
+    // argument. One non-leaf argument anywhere and the whole call falls
+    // back to the stack, which is the safe direction to be wrong in.
+    if (!n->callee) {
+      bool all_leaf = true;
+      int k = 0;
+      for (Node *a = n->args; a; a = a->next, k++)
+        if (!is_cheap_leaf(a) || k >= 6) { all_leaf = false; break; }
+      if (all_leaf && k > 0) {
+        int i = 0;
+        for (Node *a = n->args; a; a = a->next, i++)
+          load_leaf_into(a, i);
+        emit("mov $0, %%rax");
+        if (depth % 2 != 0) emit("sub $8, %%rsp");
+        emit("call %s", n->funcname);
+        if (depth % 2 != 0) emit("add $8, %%rsp");
+        if (n->ret_buf) goto ret_buf_store;
+        return;
+      }
+    }
+
     int nargs = 0;
     for (Node *a = n->args; a; a = a->next) {
       if (is_aggregate(a->ty)) {
@@ -4216,6 +4287,7 @@ static void gen_expr(Node *n) {
     // addressed rather than held, so it is written into a hidden local and
     // the call's value becomes that local's address.
     if (n->ret_buf) {
+    ret_buf_store:;
       int sz = n->ret_buf->ty->size;
       for (int i = 0; i < (sz + 7) / 8; i++) {
         char *src64 = (i == 0) ? "%rax" : "%rdx";
@@ -4244,10 +4316,25 @@ static void gen_expr(Node *n) {
   }
 
   // Binary operators: evaluate rhs first so lhs lands in rax.
-  gen_expr(n->rhs);
-  push();
-  gen_expr(n->lhs);
-  pop("%rdi");
+  //
+  // Unless the right operand is a leaf -- a constant, or a scalar local --
+  // in which case it can be put straight into %rdi after the left side has
+  // been computed, and the push/pop pair disappears. Over a quarter of this
+  // compiler's output was those pairs.
+  //
+  // The reordering is safe precisely because a leaf has no side effects, so
+  // nothing observable depends on which side runs first. And loading %rdi
+  // AFTER the left operand is what makes it safe at all: the left operand
+  // may contain a call, and a call is free to clobber %rdi.
+  if (is_cheap_leaf(n->rhs)) {
+    gen_expr(n->lhs);
+    load_leaf_into(n->rhs, 0);   // %rdi
+  } else {
+    gen_expr(n->rhs);
+    push();
+    gen_expr(n->lhs);
+    pop("%rdi");
+  }
 
   // Use 32-bit forms when both operands are narrow, so that int arithmetic
   // wraps at 32 bits the way C requires.

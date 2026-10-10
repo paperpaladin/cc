@@ -180,8 +180,17 @@ Three deliberate corners, each marked `shortcut:` in the source with its
 ceiling:
 
 - **Stack-machine codegen, no register allocator.** Every binary operator
-  pushes and pops. The output is roughly 3x the instructions a real compiler
-  emits. Worth fixing only once self-hosting is green and compile time matters.
+  pushes and pops its operands. Two cases avoid it -- a leaf right operand
+  goes straight into `%rdi`, and a call whose arguments are all leaves
+  loads each one directly into its own register -- which is worth about 3%
+  and is not a fix. Compiling this compiler's own 4,677 lines emits 37,646
+  instructions against `gcc -O0`'s 15,925, so the gap is still 2.4x and
+  closing it means a real register allocator (PLAN item 22).
+
+  Measuring this needs a *frozen* input, which is not obvious until it
+  bites: the first numbers here compared the compiler's output on `cc.c`
+  before and after a change to `cc.c` itself, so a 2.4% improvement read as
+  a 0.7% regression. The benchmark is now a fixed snapshot.
 - **Nothing is freed.** A compiler is a short-lived process; `exit` reclaims.
 - **`gcc` assembles and links.** Writing an assembler is a different project.
 
