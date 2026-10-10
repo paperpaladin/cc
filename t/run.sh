@@ -298,6 +298,37 @@ refuse 'int f(void); char f(void){return 1;} int main(){return 0;}'
 # about its arguments, so it must not be checked; "f(void)" must.
 check 0   'int f(); int main(){ return f(1,2,3); } int f(int a,int b,int c){ return a+b+c-6; }'
 
+# --- unsigned comparison (PLAN 08b)
+# ">" is parsed as "<" with the operands swapped, so a rule that reads only
+# the left operand gets the signedness from whichever side the parser happened
+# to put the literal on. "x < 5" compared unsigned and "x > 5" did not.
+check 1   'int main(){ unsigned x = -1; return x > 5; }'
+check 1   'int main(){ unsigned x = -1; return 5 < x; }'
+check 1   'int main(){ unsigned x = -1; return x > 0; }'
+check 1   'int main(){ unsigned x = -1; return x >= 1; }'
+check 0   'int main(){ unsigned x = -1; return x < 5; }'
+check 1   'int main(){ unsigned long u = -1; return u > 5; }'
+check 1   'int main(){ unsigned x = 10; return 2 / x == 0; }'
+
+# The cases a blunt "either side is unsigned" rule would break.
+#
+# An unsigned char promotes to signed int, because an int holds every value
+# it can have, so the comparison against a negative stays signed. Both
+# operand positions need their own case: ">" swaps them, so a rule that
+# promotes only one side is correct in one direction and wrong in the other,
+# and 200 > 100 cannot tell the difference because neither value is negative.
+check 0   'int main(){ unsigned char x = 1; int y = -1; return x < y; }'
+check 1   'int main(){ unsigned char x = 1; int y = -1; return x > y; }'
+check 0   'int main(){ unsigned short s = 1; int y = -1; return s < y; }'
+check 1   'int main(){ unsigned short s = 1; int y = -1; return s > y; }'
+check 1   'int main(){ unsigned char x = 200; return x > 100; }'
+
+# An unsigned int widens to long and compares signed, because a long holds
+# every unsigned int on LP64.
+check 1   'int main(){ unsigned int u = 1; long l = -1; return l < u; }'
+check 0   'int main(){ unsigned int u = 1; long l = -1; return l > u; }'
+check 0   'int main(){ int a=-1; return a > 5; }'
+
 #__APPEND_BELOW__
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

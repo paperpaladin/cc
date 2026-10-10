@@ -2992,6 +2992,32 @@ static void gen_cast(Type *from, Type *to) {
   else if (to->size == 4) emit("mov %%eax, %%eax");     // truncate to 32 bits
 }
 
+// Does this binary operation compare and divide as unsigned?
+//
+// C 6.3.1.8's usual arithmetic conversions decide it from BOTH operands, and
+// reading only the left one is wrong in a way the parser makes easy to miss:
+// "x > 5" is built as ND_LT with the operands swapped, so the literal ends up
+// on the left. An unsigned x therefore compared signed, while "x < 5" on the
+// same variable compared unsigned.
+//
+// The rule, for the integer types this compiler has:
+//   - promote anything narrower than int to signed int, since an int holds
+//     every value an unsigned char or unsigned short can have
+//   - the wider rank wins outright, which is why "long < unsigned int" stays
+//     signed on LP64: a long represents every unsigned int
+//   - at equal rank, unsigned wins
+static bool op_unsigned(Type *a, Type *b) {
+  if (is_pointer(a) || is_pointer(b)) return true;   // addresses never go negative
+
+  int asz = a->size < 4 ? 4 : a->size;
+  int bsz = b->size < 4 ? 4 : b->size;
+  bool au = a->size < 4 ? false : a->is_unsigned;
+  bool bu = b->size < 4 ? false : b->is_unsigned;
+
+  if (asz != bsz) return asz > bsz ? au : bu;
+  return au || bu;
+}
+
 static void gen_expr(Node *n) {
   switch (n->kind) {
   case ND_NUM:
@@ -3121,8 +3147,8 @@ static void gen_expr(Node *n) {
   bool wide = (n->lhs->ty->size == 8 || n->rhs->ty->size == 8 || is_pointer(n->lhs->ty));
   char *ax = wide ? "%rax" : "%eax";
   char *di = wide ? "%rdi" : "%edi";
-  // Signedness decides div vs idiv and setb vs setl. Pointers compare unsigned.
-  bool uns = n->lhs->ty->is_unsigned || is_pointer(n->lhs->ty);
+  // Signedness decides div vs idiv and setb vs setl.
+  bool uns = op_unsigned(n->lhs->ty, n->rhs->ty);
 
   switch (n->kind) {
   case ND_ADD: emit("add %s, %s", di, ax); return;
