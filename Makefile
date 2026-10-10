@@ -7,6 +7,15 @@ test: cc
 	@./t/run.sh
 	@./t/cpp.sh
 
+# Random programs, judged by gcc and clang. Not in `test` because it is
+# slow and because its value is in volume: run it with a wide seed range.
+# t/gen.py's header explains the rules that keep a generated program free of
+# undefined behaviour, which is the entire difficulty.
+fuzz: cc
+	@./t/fuzz.sh $(FROM) $(TO)
+FROM = 1
+TO = 200
+
 # The fixpoint, and the proof that the stage-2 compiler is more than stable.
 # Not folded into `test`: it builds the compiler three times and runs the
 # whole suite twice, which is minutes rather than seconds.
@@ -39,6 +48,6 @@ diff-test: cc
 	@./t/differential.sh
 
 clean:
-	rm -f cc cc-asan *.s *.cc.s a.out t/tmp*
+	rm -f cc cc-asan *.s *.cc.s a.out t/tmp* t/fuzz-fail-*.c
 
-.PHONY: test test-asan self-host diff-test clean
+.PHONY: test test-asan self-host fuzz diff-test clean

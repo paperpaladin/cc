@@ -506,10 +506,40 @@ initialisers. That is the whole remaining distance to the fixpoint.
             silently generating wrong code for something that looked close
             enough, and four documented gaps now assert they refuse instead.
 
+**Milestone 1 is complete.** The compiler self-hosts, and `make self-host`
+asserts both halves of that: the fixpoint, and the stage-2 compiler passing
+the whole suite.
+
 ### Milestone 2 -- external conformance
 
 - [ ] 18 `c-testsuite` runner, publishing the pass rate with the failures named
 - [ ] 19 csmith differential fuzzing against gcc and clang
+      note: csmith has to be fetched and built, and nothing in this project
+            downloads and runs third-party code without being asked. 19b
+            takes the same approach with a generator written here -- the
+            generator being ours costs nothing, because the ORACLE is still
+            gcc and clang, and that is the part that has to be independent.
+- [x] 19b a random program generator, differentially tested against gcc and
+      clang, needing nothing fetched
+      done: t/gen.py and t/fuzz.sh, plus `make fuzz` and a 20-seed smoke
+            run inside `make test`. The hard part is not emitting C, it is
+            emitting C that is DEFINED: arithmetic in unsigned long so
+            overflow wraps, every divisor `| 1`, every shift count `& 63`,
+            every variable initialised before it is read. Without that the
+            references disagree with each other and a difference against us
+            proves nothing.
+            Seeds where gcc and clang disagree are skipped AND counted, so
+            the denominator cannot shrink quietly.
+      proves: 3 planted defects in codegen, caught by 26, 13 and 44 of 100
+            seeds. A fuzzer that has never been watched to fail is a
+            fuzzer that always passes.
+      limit: it cannot find a signed-overflow bug, because it never
+            generates signed overflow. Stated rather than left implied.
+      found: two bugs in the generator itself on the first run, both caught
+            because all three compilers rejected the output rather than
+            disagreeing about it -- a literal %% in a non-format string,
+            and variables declared in a nested block escaping their scope
+            into the final fold.
       why: finds the cases I would never think to write. Every expectation I have
            written by hand in this project that was wrong, five so far, would have
            been caught here for free.

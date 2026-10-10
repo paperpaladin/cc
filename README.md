@@ -308,6 +308,40 @@ int main(){ int i = -1; return f(i); }   // 1 only if the call sign-extends
 
 With that case in, the mutant dies.
 
+### Random programs, judged by two compilers
+
+```
+$ make fuzz FROM=1 TO=2000
+2000 agree, 0 disagree, 0 skipped
+```
+
+`t/gen.py` writes a random C program; gcc and clang say what it should
+return. The generator being ours costs nothing, because **the generator is
+not the oracle**.
+
+The difficulty is not emitting C, it is emitting C that is *defined*. A
+random expression is overwhelmingly likely to overflow a signed int, divide
+by zero, or shift by a negative amount -- and at that point gcc and clang
+are each entitled to a different answer, so a disagreement with us would
+prove nothing. Arithmetic is therefore done in `unsigned long`, where
+overflow is defined to wrap; every divisor is `| 1` so it is odd and never
+zero; every shift count is `& 63`. That is also the honest limit of what it
+can find: it will never catch a signed-overflow bug, because it never
+generates one.
+
+If gcc and clang disagree with **each other**, the generator let undefined
+behaviour through. Those seeds are skipped and counted, because a silently
+shrinking denominator is how a fuzzer stops meaning anything.
+
+And because a fuzzer that always passes is worth nothing, it was checked
+against planted defects rather than assumed to work:
+
+| planted defect | seeds that caught it |
+|---|---|
+| unsigned division emitted as signed | 26 of 100 |
+| shift count taken from the wrong place | 13 of 100 |
+| `xor` emitted as `or` | 44 of 100 |
+
 ### Checking a type, not just a number
 
 The usual arithmetic conversions are verified by 368 generated expressions
