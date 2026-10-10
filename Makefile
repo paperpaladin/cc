@@ -5,6 +5,7 @@ cc: cc.c
 
 test: cc
 	@./t/run.sh
+	@./t/cpp.sh
 
 # Differential test: every t/ case must agree with gcc AND clang.
 diff-test: cc

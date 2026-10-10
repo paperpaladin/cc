@@ -172,9 +172,9 @@ static bool is_keyword(Token *t) {
 static char *PUNCT[] = {
   "<<=", ">>=", "...",
   "==", "!=", "<=", ">=", "&&", "||", "++", "--",
-  "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>", "->",
+  "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>", "->", "##",
   "+", "-", "*", "/", "%", "(", ")", "{", "}", "[", "]",
-  "<", ">", "=", ";", ",", "&", "|", "^", "~", "!", "?", ":", ".",
+  "<", ">", "=", ";", ",", "&", "|", "^", "~", "!", "?", ":", ".", "#",
   NULL,
 };
 
@@ -1774,6 +1774,1031 @@ static Obj *parse(Token *t) {
   return globals;
 }
 
+// --------------------------------------------------------------- preprocessor
+//
+// Runs between the tokenizer and the parser, and is placed after the parser in
+// this file for one reason: #if has to evaluate a constant expression, and
+// borrowing const_expr() above is better than growing a second one that would
+// then disagree with it.
+//
+// Directives are the easy half. The hard half is that expansion must stop:
+//
+//     #define f(x) f(x)
+//     f(1)            must become f(1), not loop
+//
+// C 6.10.3.4 does this by painting a macro blue inside its own expansion.
+// Every token produced by expanding f carries f in its *hide set* and can
+// never be expanded by f again. The set is per token rather than global
+// because the same identifier can be live in one argument and painted in
+// another, so a single "currently expanding" flag gives the wrong answer.
+
+typedef struct Macro Macro;
+typedef struct MacroParam MacroParam;
+typedef struct MacroArg MacroArg;
+typedef struct CondIncl CondIncl;
+
+struct HideSet {
+  HideSet *next;
+  char *name;
+};
+
+struct MacroParam {
+  MacroParam *next;
+  char *name;
+};
+
+struct MacroArg {
+  MacroArg *next;
+  char *name;
+  Token *tok;       // the argument as written, EOF-terminated
+  Token *expanded;  // the same after expansion, computed once on demand
+};
+
+struct Macro {
+  Macro *next;
+  char *name;
+  bool is_objlike;
+  bool is_variadic;
+  MacroParam *params;
+  char *va_name;    // what the variadic tail is called: __VA_ARGS__, or a name
+  Token *body;
+  Token *(*builtin)(Token *tok);   // __FILE__ and __LINE__ have no fixed body
+};
+
+struct CondIncl {
+  CondIncl *next;
+  enum { IN_THEN, IN_ELIF, IN_ELSE } ctx;
+  Token *tok;
+  bool included;    // some branch of this #if has already been taken
+};
+
+static Macro *macros;
+static CondIncl *cond_incl;
+static char *include_paths[64];
+static int n_include_paths;
+
+static Token *preprocess2(Token *tok);
+static Token *copy_token(Token *t);
+
+// A NUL-terminated copy of a token's spelling.
+static char *tok_text(Token *t) {
+  char *s = malloc(t->len + 1);
+  memcpy(s, t->loc, t->len);
+  s[t->len] = 0;
+  return s;
+}
+
+static Token *copy_token(Token *t) {
+  Token *c = calloc(1, sizeof(Token));
+  *c = *t;
+  c->next = NULL;
+  return c;
+}
+
+static Token *new_eof(Token *t) {
+  Token *e = copy_token(t);
+  e->kind = TK_EOF;
+  e->len = 0;
+  return e;
+}
+
+// ---- hide sets ------------------------------------------------------------
+
+static bool hide_contains(HideSet *hs, char *name) {
+  for (; hs; hs = hs->next)
+    if (!strcmp(hs->name, name)) return true;
+  return false;
+}
+
+static HideSet *hide_add(HideSet *hs, char *name) {
+  HideSet *h = calloc(1, sizeof(HideSet));
+  h->name = name;
+  h->next = hs;
+  return h;
+}
+
+static HideSet *hide_union(HideSet *a, HideSet *b) {
+  HideSet head = {0};
+  HideSet *cur = &head;
+  for (; a; a = a->next) {
+    cur->next = calloc(1, sizeof(HideSet));
+    cur = cur->next;
+    cur->name = a->name;
+  }
+  cur->next = b;
+  return head.next;
+}
+
+// Function-like macros intersect the hide sets of the name and the closing
+// paren. The tokens between them may have come from different expansions, and
+// only what both ends agree is painted may be carried forward.
+static HideSet *hide_intersect(HideSet *a, HideSet *b) {
+  HideSet head = {0};
+  HideSet *cur = &head;
+  for (; a; a = a->next)
+    if (hide_contains(b, a->name)) {
+      cur->next = calloc(1, sizeof(HideSet));
+      cur = cur->next;
+      cur->name = a->name;
+    }
+  return head.next;
+}
+
+// An expansion belongs to where it was written, not where it was defined.
+// Without this, __LINE__ inside a macro body reports the #define's line, and
+// an error inside an expansion points into the macro instead of the call.
+static void stamp_site(Token *tok, Token *site) {
+  for (; tok && tok->kind != TK_EOF; tok = tok->next) {
+    tok->file = site->file;
+    tok->line = site->line;
+  }
+}
+
+static Token *add_hide(Token *tok, HideSet *hs) {
+  Token head = {0};
+  Token *cur = &head;
+  for (; tok && tok->kind != TK_EOF; tok = tok->next) {
+    cur = cur->next = copy_token(tok);
+    cur->hide = hide_union(cur->hide, hs);
+  }
+  cur->next = tok ? copy_token(tok) : NULL;
+  return head.next;
+}
+
+// ---- line handling --------------------------------------------------------
+
+static bool is_hash(Token *t) { return t->at_bol && tok_is(t, "#"); }
+
+// Everything from tok to the end of its line, EOF-terminated, with *rest left
+// on the next line. Directives are line-shaped and the rest of the engine is
+// not, so this is the seam between the two.
+static Token *copy_line(Token **rest, Token *tok) {
+  Token head = {0};
+  Token *cur = &head;
+  for (; tok->kind != TK_EOF && !tok->at_bol; tok = tok->next)
+    cur = cur->next = copy_token(tok);
+  cur->next = new_eof(tok);
+  *rest = tok;
+  return head.next;
+}
+
+// Advance to the first token of the next line. Note the precondition: tok
+// must be a token the caller has already consumed, because a token that is
+// itself at_bol is already "the next line" and this returns it unchanged.
+// Passing the directive's own '#' therefore makes no progress at all, which
+// is how the conditional skipper below hung.
+static Token *skip_line(Token *tok) {
+  if (tok->kind == TK_EOF) return tok;
+  while (tok->kind != TK_EOF && !tok->at_bol) tok = tok->next;
+  return tok;
+}
+
+// Splice two streams. a's EOF is dropped; b's is kept.
+static Token *append(Token *a, Token *b) {
+  if (!a || a->kind == TK_EOF) return b;
+  Token head = {0};
+  Token *cur = &head;
+  for (; a && a->kind != TK_EOF; a = a->next)
+    cur = cur->next = copy_token(a);
+  cur->next = b;
+  return head.next;
+}
+
+// Tokenize text this pass built rather than read. The buffer is registered as
+// a File so that an error inside a paste still gets a caret, pointing at the
+// generated text, which is the only place the bad token actually exists.
+static Token *tokenize_string(char *name, char *text) {
+  File *sf = tk_file;
+  int sl = tk_line;
+  bool sb = tk_bol, ss = tk_space;
+  Token *t = tokenize(new_file(name, text));
+  tk_file = sf; tk_line = sl; tk_bol = sb; tk_space = ss;
+  return t;
+}
+
+// ---- the macro table ------------------------------------------------------
+
+static Macro *find_macro(Token *t) {
+  if (t->kind != TK_IDENT) return NULL;
+  for (Macro *m = macros; m; m = m->next)
+    if ((int)strlen(m->name) == t->len && !strncmp(m->name, t->loc, t->len))
+      return m;
+  return NULL;
+}
+
+static void undef_macro(char *name) {
+  Macro **p = &macros;
+  while (*p) {
+    if (!strcmp((*p)->name, name)) { *p = (*p)->next; continue; }
+    p = &(*p)->next;
+  }
+}
+
+static Macro *add_macro(char *name, bool is_objlike, Token *body) {
+  undef_macro(name);   // a redefinition replaces; C requires it be identical,
+                       // which we do not police -- see README
+  Macro *m = calloc(1, sizeof(Macro));
+  m->name = name;
+  m->is_objlike = is_objlike;
+  m->body = body;
+  m->next = macros;
+  macros = m;
+  return m;
+}
+
+static Macro *add_builtin(char *name, Token *(*fn)(Token *)) {
+  Macro *m = add_macro(name, true, NULL);
+  m->builtin = fn;
+  return m;
+}
+
+// ---- # and ## -------------------------------------------------------------
+
+// The spelling of a token sequence, with the single space that has_space
+// recorded. C requires exactly this: "a + b" stringizes with its spacing
+// normalized to one space, and no space where the source had none.
+static char *join_tokens(Token *tok, Token *end) {
+  int len = 1;
+  for (Token *t = tok; t != end && t->kind != TK_EOF; t = t->next)
+    len += t->len + 1;
+
+  char *buf = calloc(1, len);
+  int pos = 0;
+  for (Token *t = tok; t != end && t->kind != TK_EOF; t = t->next) {
+    if (pos && t->has_space) buf[pos++] = ' ';
+    memcpy(buf + pos, t->loc, t->len);
+    pos += t->len;
+  }
+  buf[pos] = 0;
+  return buf;
+}
+
+// #arg. The result is a string literal token, so embedded quotes and
+// backslashes have to be escaped on the way in.
+static Token *stringize(Token *hash, Token *arg) {
+  char *raw = join_tokens(arg, NULL);
+
+  int n = 0;
+  for (char *p = raw; *p; p++) n += (*p == '"' || *p == '\\') ? 2 : 1;
+  char *quoted = calloc(1, n + 3);
+  int pos = 0;
+  quoted[pos++] = '"';
+  for (char *p = raw; *p; p++) {
+    if (*p == '"' || *p == '\\') quoted[pos++] = '\\';
+    quoted[pos++] = *p;
+  }
+  quoted[pos++] = '"';
+  quoted[pos] = 0;
+
+  Token *t = tokenize_string("<stringize>", quoted);
+  t = copy_token(t);
+  t->at_bol = hash->at_bol;
+  t->has_space = hash->has_space;
+  return t;
+}
+
+// lhs ## rhs. The two spellings are concatenated and retokenized, and the
+// result must be exactly one token: "+" ## "+" is ++, but "+" ## "x" is not a
+// token at all and is an error rather than two tokens pretending to be one.
+static Token *paste(Token *lhs, Token *rhs) {
+  char *buf = calloc(1, lhs->len + rhs->len + 1);
+  memcpy(buf, lhs->loc, lhs->len);
+  memcpy(buf + lhs->len, rhs->loc, rhs->len);
+  buf[lhs->len + rhs->len] = 0;
+
+  Token *t = tokenize_string("<paste>", buf);
+  if (t->kind == TK_EOF || t->next->kind != TK_EOF)
+    error_at(lhs->loc, "pasting \"%s\" and \"%s\" does not give a valid token",
+             tok_text(lhs), tok_text(rhs));
+  t = copy_token(t);
+  t->at_bol = lhs->at_bol;
+  t->has_space = lhs->has_space;
+  return t;
+}
+
+// ---- arguments ------------------------------------------------------------
+
+static MacroArg *find_arg(MacroArg *args, Token *t) {
+  if (t->kind != TK_IDENT) return NULL;
+  for (MacroArg *a = args; a; a = a->next)
+    if ((int)strlen(a->name) == t->len && !strncmp(a->name, t->loc, t->len))
+      return a;
+  return NULL;
+}
+
+// One argument: tokens up to a comma or the closing paren, at depth zero.
+// Nested parens and commas inside them belong to the argument, which is why
+// f(g(1,2)) is one argument and not two.
+static Token *read_one_arg(Token **rest, Token *tok, bool to_paren) {
+  Token head = {0};
+  Token *cur = &head;
+  int depth = 0;
+
+  for (;;) {
+    if (tok->kind == TK_EOF) error_at(tok->loc, "unterminated macro argument list");
+    if (depth == 0 && tok_is(tok, ")")) break;
+    if (depth == 0 && !to_paren && tok_is(tok, ",")) break;
+
+    if (tok_is(tok, "(")) depth++;
+    else if (tok_is(tok, ")")) depth--;
+
+    cur = cur->next = copy_token(tok);
+    tok = tok->next;
+  }
+  cur->next = new_eof(tok);
+  *rest = tok;
+  return head.next;
+}
+
+static MacroArg *read_macro_args(Token **rest, Token *tok, Macro *m) {
+  Token *start = tok;
+  tok = tok->next->next;   // skip the macro name and '('
+
+  MacroArg head = {0};
+  MacroArg *cur = &head;
+
+  for (MacroParam *p = m->params; p; p = p->next) {
+    if (cur != &head) {
+      if (!tok_is(tok, ",")) error_at(tok->loc, "expected ',' in arguments to '%s'", m->name);
+      tok = tok->next;
+    }
+    cur = cur->next = calloc(1, sizeof(MacroArg));
+    cur->name = p->name;
+    cur->tok = read_one_arg(&tok, tok, false);
+  }
+
+  if (m->is_variadic) {
+    Token *rest_tok;
+    if (tok_is(tok, ")")) {
+      // No variadic arguments at all. The parameter still exists and expands
+      // to nothing, which is what makes the GNU ", ## __VA_ARGS__" comma
+      // deletion below necessary.
+      rest_tok = new_eof(tok);
+    } else {
+      if (m->params) {
+        if (!tok_is(tok, ",")) error_at(tok->loc, "expected ',' before the variadic arguments to '%s'", m->name);
+        tok = tok->next;
+      }
+      rest_tok = read_one_arg(&tok, tok, true);
+    }
+    cur = cur->next = calloc(1, sizeof(MacroArg));
+    cur->name = m->va_name;
+    cur->tok = rest_tok;
+  } else if (m->params == NULL) {
+    // f() with no parameters: consume nothing, but still require the paren.
+    if (!tok_is(tok, ")")) error_at(tok->loc, "'%s' takes no arguments", m->name);
+  }
+
+  if (!tok_is(tok, ")"))
+    error_at(tok->loc, "too many arguments to '%s'", m->name);
+  (void)start;
+  *rest = tok->next;
+  return head.next;
+}
+
+// An argument is expanded before substitution, except where it is the operand
+// of # or ##. Done once and cached: an argument used twice must not be
+// expanded twice, or a macro with a side-effecting expansion changes meaning
+// with how often its parameter appears.
+static Token *expand_arg(MacroArg *arg) {
+  if (!arg->expanded) arg->expanded = preprocess2(arg->tok);
+  return arg->expanded;
+}
+
+// ---- substitution ---------------------------------------------------------
+
+static Token *subst(Token *body, MacroArg *args) {
+  Token head = {0};
+  Token *cur = &head;
+
+  while (body && body->kind != TK_EOF) {
+    // #param
+    if (tok_is(body, "#") && body->next && find_arg(args, body->next)) {
+      cur = cur->next = stringize(body, find_arg(args, body->next)->tok);
+      body = body->next->next;
+      continue;
+    }
+
+    // GNU: ", ## __VA_ARGS__" deletes the comma when the tail is empty.
+    // glibc's headers are built on this, so a preprocessor that refuses it
+    // cannot read /usr/include at all.
+    if (tok_is(body, ",") && body->next && tok_is(body->next, "##") &&
+        body->next->next && find_arg(args, body->next->next)) {
+      MacroArg *arg = find_arg(args, body->next->next);
+      if (arg->tok->kind == TK_EOF) {
+        body = body->next->next->next;   // drop ',' '##' and the empty arg
+        continue;
+      }
+      cur = cur->next = copy_token(body);        // keep the comma
+      body = body->next->next;                   // step over '##'
+      for (Token *t = arg->tok; t && t->kind != TK_EOF; t = t->next)
+        cur = cur->next = copy_token(t);
+      body = body->next;
+      continue;
+    }
+
+    // lhs ## rhs
+    if (tok_is(body, "##")) {
+      if (cur == &head) error_at(body->loc, "'##' cannot appear at the start of a macro body");
+      if (!body->next || body->next->kind == TK_EOF)
+        error_at(body->loc, "'##' cannot appear at the end of a macro body");
+
+      Token *rhs = body->next;
+      MacroArg *arg = find_arg(args, rhs);
+      if (arg) {
+        // Unexpanded, per the standard: the operand of ## is the argument as
+        // written.
+        if (arg->tok->kind != TK_EOF) {
+          *cur = *paste(cur, arg->tok);
+          for (Token *t = arg->tok->next; t && t->kind != TK_EOF; t = t->next)
+            cur = cur->next = copy_token(t);
+        }
+      } else {
+        *cur = *paste(cur, rhs);
+      }
+      body = rhs->next;
+      continue;
+    }
+
+    MacroArg *arg = find_arg(args, body);
+    if (arg) {
+      // param ## something: the argument is used unexpanded.
+      if (body->next && tok_is(body->next, "##")) {
+        if (arg->tok->kind == TK_EOF) {
+          // An empty argument before ## makes the paste vanish rather than
+          // paste against nothing.
+          body = body->next->next;
+          MacroArg *rhs_arg = find_arg(args, body);
+          if (rhs_arg) {
+            for (Token *t = rhs_arg->tok; t && t->kind != TK_EOF; t = t->next)
+              cur = cur->next = copy_token(t);
+          } else if (body && body->kind != TK_EOF) {
+            cur = cur->next = copy_token(body);
+          }
+          if (body && body->kind != TK_EOF) body = body->next;
+          continue;
+        }
+        for (Token *t = arg->tok; t && t->kind != TK_EOF; t = t->next)
+          cur = cur->next = copy_token(t);
+        body = body->next;
+        continue;
+      }
+
+      Token *e = expand_arg(arg);
+      bool first = true;
+      for (Token *t = e; t && t->kind != TK_EOF; t = t->next) {
+        cur = cur->next = copy_token(t);
+        // The spacing of the use site wins over the spacing inside the
+        // argument, so "f (x)" and "f(x)" stringize the same.
+        if (first) { cur->has_space = body->has_space; cur->at_bol = body->at_bol; first = false; }
+      }
+      body = body->next;
+      continue;
+    }
+
+    cur = cur->next = copy_token(body);
+    body = body->next;
+  }
+
+  cur->next = body ? copy_token(body) : NULL;
+  return head.next;
+}
+
+// ---- expansion ------------------------------------------------------------
+
+// Expand one macro at tok, if there is one. Returns false when tok is not a
+// macro use, which is the common case and must stay cheap.
+static bool expand_macro(Token **rest, Token *tok) {
+  if (hide_contains(tok->hide, tok_text(tok))) return false;
+
+  Macro *m = find_macro(tok);
+  if (!m) return false;
+
+  if (m->builtin) {
+    *rest = append(m->builtin(tok), tok->next);
+    return true;
+  }
+
+  if (m->is_objlike) {
+    HideSet *hs = hide_add(tok->hide, m->name);
+    Token *body = add_hide(subst(m->body, NULL), hs);
+    stamp_site(body, tok);
+    if (body) {
+      body->at_bol = tok->at_bol;
+      body->has_space = tok->has_space;
+    }
+    *rest = append(body, tok->next);
+    return true;
+  }
+
+  // A function-like macro name not followed by '(' is just an identifier.
+  // This is why "#define getc(f) ..." does not break a function pointer
+  // called getc.
+  if (!tok->next || !tok_is(tok->next, "(")) return false;
+
+  Token *rparen_probe = tok;
+  MacroArg *args = read_macro_args(&rparen_probe, tok, m);
+  // read_macro_args leaves rparen_probe after ')', so back up one for the
+  // hide set intersection the standard asks for.
+  Token *rparen = tok;
+  for (Token *t = tok; t != rparen_probe; t = t->next) rparen = t;
+
+  HideSet *hs = hide_intersect(tok->hide, rparen->hide);
+  hs = hide_add(hs, m->name);
+
+  Token *body = add_hide(subst(m->body, args), hs);
+  stamp_site(body, tok);
+  if (body) {
+    body->at_bol = tok->at_bol;
+    body->has_space = tok->has_space;
+  }
+  *rest = append(body, rparen_probe);
+  return true;
+}
+
+// ---- #if ------------------------------------------------------------------
+
+static Token *read_const_expr(Token **rest, Token *tok) {
+  tok = copy_line(rest, tok);
+
+  Token head = {0};
+  Token *cur = &head;
+
+  while (tok->kind != TK_EOF) {
+    // "defined(X)" and "defined X" are resolved before expansion, because
+    // after expansion X is gone.
+    if (tok->kind == TK_IDENT && tok_is(tok, "defined")) {
+      Token *start = tok;
+      tok = tok->next;
+      bool paren = tok_is(tok, "(");
+      if (paren) tok = tok->next;
+      if (tok->kind != TK_IDENT)
+        error_at(start->loc, "'defined' expects an identifier");
+      Macro *m = find_macro(tok);
+      tok = tok->next;
+      if (paren) {
+        if (!tok_is(tok, ")")) error_at(start->loc, "expected ')' after 'defined('");
+        tok = tok->next;
+      }
+      cur = cur->next = copy_token(start);
+      cur->kind = TK_NUM;
+      cur->val = m ? 1 : 0;
+      cur->len = 1;
+      cur->loc = m ? "1" : "0";
+      continue;
+    }
+    cur = cur->next = copy_token(tok);
+    tok = tok->next;
+  }
+  cur->next = copy_token(tok);
+  return head.next;
+}
+
+static long eval_const_line(Token **rest, Token *tok) {
+  Token *start = tok;
+  Token *expr = preprocess2(read_const_expr(rest, tok->next));
+
+  if (expr->kind == TK_EOF)
+    error_at(start->loc, "#%s with no expression", tok_text(start->next ? start : start));
+
+  // Any identifier that survived expansion is 0, including 'true', 'false'
+  // and anything else undefined. This is C 6.10.1p4, and it is also why the
+  // parser below never sees a name it would try to look up.
+  for (Token *t = expr; t && t->kind != TK_EOF; t = t->next) {
+    if (t->kind == TK_IDENT) {
+      t->kind = TK_NUM;
+      t->val = 0;
+      t->loc = "0";
+      t->len = 1;
+    }
+  }
+
+  // Borrow the real expression parser. Saving and restoring the cursor keeps
+  // this reentrant with respect to the parse that has not started yet.
+  Token *save = tk;
+  tk = expr;
+  long v = const_expr();
+  if (tk->kind != TK_EOF) error_at(tk->loc, "extra tokens after the #if expression");
+  tk = save;
+  return v;
+}
+
+// ---- conditionals ---------------------------------------------------------
+
+static CondIncl *push_cond(Token *tok, bool included) {
+  CondIncl *ci = calloc(1, sizeof(CondIncl));
+  ci->next = cond_incl;
+  ci->ctx = IN_THEN;
+  ci->tok = tok;
+  ci->included = included;
+  cond_incl = ci;
+  return ci;
+}
+
+// Skip to the matching #else/#elif/#endif without expanding anything. Nested
+// conditionals are counted so that a #endif belonging to an inner #if does not
+// end the outer one -- and crucially nothing in here is evaluated, so a
+// disabled branch may contain syntax this compiler cannot parse.
+static Token *skip_cond_incl(Token *tok) {
+  int depth = 0;
+  while (tok->kind != TK_EOF) {
+    if (is_hash(tok) && tok->next->kind != TK_EOF) {
+      Token *d = tok->next;
+      if (tok_is(d, "if") || tok_is(d, "ifdef") || tok_is(d, "ifndef")) {
+        depth++;
+      } else if (tok_is(d, "endif")) {
+        if (depth == 0) return tok;
+        depth--;
+      } else if (depth == 0 && (tok_is(d, "else") || tok_is(d, "elif"))) {
+        return tok;
+      }
+    }
+    // tok->next, not tok: tok starts its line in every iteration here, and
+    // skip_line would hand it straight back.
+    tok = skip_line(tok->next);
+  }
+  return tok;
+}
+
+// ---- #include -------------------------------------------------------------
+
+static char *join_path(char *dir, char *file) {
+  char *p = malloc(strlen(dir) + strlen(file) + 2);
+  sprintf(p, "%s/%s", dir, file);
+  return p;
+}
+
+static bool file_exists(char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f) return false;
+  fclose(f);
+  return true;
+}
+
+static char *search_include(char *name, bool is_angle, Token *tok) {
+  if (name[0] == '/') return file_exists(name) ? name : NULL;
+
+  // A quoted include looks next to the including file first. Using the
+  // process's cwd instead is a classic way to find the wrong header when the
+  // compiler is run from another directory.
+  if (!is_angle && tok->file) {
+    char *dir = strdup(tok->file->name);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = 0; else strcpy(dir, ".");
+    char *p = join_path(dir, name);
+    if (file_exists(p)) return p;
+  }
+  for (int i = 0; i < n_include_paths; i++) {
+    char *p = join_path(include_paths[i], name);
+    if (file_exists(p)) return p;
+  }
+  return NULL;
+}
+
+// The filename in an #include is not an ordinary token sequence: <stdio.h>
+// tokenizes as '<' 'stdio' '.' 'h' '>', so it is read back from the source
+// text between the angle brackets rather than from the tokens.
+static char *read_include_filename(Token **rest, Token *tok, bool *is_angle) {
+  if (tok->kind == TK_STR) {
+    // Not read_char-decoded: a backslash in an include path is literal.
+    *is_angle = false;
+    *rest = skip_line(tok);
+    char *s = calloc(1, tok->len - 1);
+    memcpy(s, tok->loc + 1, tok->len - 2);
+    return s;
+  }
+
+  if (tok_is(tok, "<")) {
+    Token *start = tok;
+    for (; !tok_is(tok, ">"); tok = tok->next)
+      if (tok->at_bol || tok->kind == TK_EOF)
+        error_at(start->loc, "unterminated #include <...>");
+    *is_angle = true;
+    *rest = skip_line(tok);
+    int len = tok->loc - (start->loc + 1);
+    char *s = calloc(1, len + 1);
+    memcpy(s, start->loc + 1, len);
+    return s;
+  }
+
+  error_at(tok->loc, "#include expects \"FILENAME\" or <FILENAME>");
+  return NULL;
+}
+
+// ---- builtins -------------------------------------------------------------
+
+// __FILE__ and __LINE__ depend on where they are used, so they are functions
+// of the use site rather than a stored body.
+static Token *builtin_file(Token *tok) {
+  char *name = tok->file ? tok->file->name : "<unknown>";
+  char *q = malloc(strlen(name) + 3);
+  sprintf(q, "\"%s\"", name);
+  Token *t = copy_token(tokenize_string("<__FILE__>", q));
+  t->has_space = tok->has_space;
+  t->at_bol = tok->at_bol;
+  t->next = NULL;
+  return t;
+}
+
+static Token *builtin_line(Token *tok) {
+  char buf[24];
+  sprintf(buf, "%d", tok->line);
+  Token *t = copy_token(tokenize_string("<__LINE__>", strdup(buf)));
+  t->has_space = tok->has_space;
+  t->at_bol = tok->at_bol;
+  t->next = NULL;
+  return t;
+}
+
+static void init_macros(void) {
+  add_builtin("__FILE__", builtin_file);
+  add_builtin("__LINE__", builtin_line);
+}
+
+// ---- #define --------------------------------------------------------------
+
+static void read_macro_definition(Token **rest, Token *tok) {
+  if (tok->kind != TK_IDENT) error_at(tok->loc, "#define expects a macro name");
+  char *name = tok_text(tok);
+  tok = tok->next;
+
+  // The paren must be glued to the name. "#define A (x)" is an object-like
+  // macro whose body is "(x)"; "#define A(x)" is function-like. The only
+  // thing that distinguishes them is the absence of a space.
+  if (!tok->has_space && tok_is(tok, "(")) {
+    tok = tok->next;
+    MacroParam head = {0};
+    MacroParam *cur = &head;
+    bool variadic = false;
+    char *va_name = "__VA_ARGS__";
+
+    while (!tok_is(tok, ")")) {
+      if (cur != &head) {
+        if (!tok_is(tok, ",")) error_at(tok->loc, "expected ',' in the parameter list");
+        tok = tok->next;
+      }
+      if (tok_is(tok, "...")) {
+        variadic = true;
+        tok = tok->next;
+        break;
+      }
+      if (tok->kind != TK_IDENT) error_at(tok->loc, "expected a parameter name");
+      // GNU named variadic: #define E(fmt, args...)
+      if (tok->next && tok_is(tok->next, "...")) {
+        variadic = true;
+        va_name = tok_text(tok);
+        tok = tok->next->next;
+        break;
+      }
+      cur = cur->next = calloc(1, sizeof(MacroParam));
+      cur->name = tok_text(tok);
+      tok = tok->next;
+    }
+    if (!tok_is(tok, ")")) error_at(tok->loc, "expected ')' to close the parameter list");
+    tok = tok->next;
+
+    Macro *m = add_macro(name, false, copy_line(rest, tok));
+    m->params = head.next;
+    m->is_variadic = variadic;
+    m->va_name = va_name;
+    return;
+  }
+
+  add_macro(name, true, copy_line(rest, tok));
+}
+
+// ---- the main loop --------------------------------------------------------
+
+static Token *preprocess2(Token *tok) {
+  Token head = {0};
+  Token *cur = &head;
+
+  while (tok && tok->kind != TK_EOF) {
+    if (expand_macro(&tok, tok)) continue;
+
+    if (!is_hash(tok)) {
+      cur = cur->next = tok;
+      tok = tok->next;
+      continue;
+    }
+
+    Token *start = tok;
+    tok = tok->next;
+
+    if (tok->at_bol || tok->kind == TK_EOF) continue;   // a bare '#' is a null directive
+
+    if (tok_is(tok, "include")) {
+      bool is_angle;
+      char *name = read_include_filename(&tok, tok->next, &is_angle);
+      char *path = search_include(name, is_angle, start);
+      if (!path) error_at(start->loc, "cannot find include file '%s'", name);
+      Token *inc = tokenize(new_file(path, read_file(path)));
+      tok = append(inc, tok);
+      continue;
+    }
+
+    if (tok_is(tok, "define")) { read_macro_definition(&tok, tok->next); continue; }
+
+    if (tok_is(tok, "undef")) {
+      tok = tok->next;
+      if (tok->kind != TK_IDENT) error_at(tok->loc, "#undef expects a macro name");
+      undef_macro(tok_text(tok));
+      tok = skip_line(tok);
+      continue;
+    }
+
+    if (tok_is(tok, "if")) {
+      long v = eval_const_line(&tok, tok);
+      push_cond(start, v != 0);
+      if (!v) tok = skip_cond_incl(tok);
+      continue;
+    }
+
+    if (tok_is(tok, "ifdef") || tok_is(tok, "ifndef")) {
+      bool want = tok_is(tok, "ifdef");
+      tok = tok->next;
+      if (tok->kind != TK_IDENT) error_at(tok->loc, "#ifdef expects a macro name");
+      bool defined = find_macro(tok) != NULL;
+      tok = skip_line(tok);
+      push_cond(start, defined == want);
+      if (defined != want) tok = skip_cond_incl(tok);
+      continue;
+    }
+
+    if (tok_is(tok, "elif")) {
+      if (!cond_incl || cond_incl->ctx == IN_ELSE)
+        error_at(start->loc, "#elif without a matching #if");
+      cond_incl->ctx = IN_ELIF;
+      if (cond_incl->included) {
+        tok = skip_cond_incl(skip_line(tok));
+      } else {
+        long v = eval_const_line(&tok, tok);
+        if (v) cond_incl->included = true;
+        else tok = skip_cond_incl(tok);
+      }
+      continue;
+    }
+
+    if (tok_is(tok, "else")) {
+      if (!cond_incl || cond_incl->ctx == IN_ELSE)
+        error_at(start->loc, "#else without a matching #if");
+      cond_incl->ctx = IN_ELSE;
+      tok = skip_line(tok->next);
+      if (cond_incl->included) tok = skip_cond_incl(tok);
+      continue;
+    }
+
+    if (tok_is(tok, "endif")) {
+      if (!cond_incl) error_at(start->loc, "#endif without a matching #if");
+      cond_incl = cond_incl->next;
+      tok = skip_line(tok->next);
+      continue;
+    }
+
+    if (tok_is(tok, "error")) {
+      char *msg = join_tokens(tok->next, NULL);
+      error_at(start->loc, "#error %s", msg);
+    }
+
+    if (tok_is(tok, "warning")) {
+      Token *line = copy_line(&tok, tok->next);
+      fprintf(stderr, "%s:%d: warning: %s\n",
+              start->file ? start->file->name : "?", start->line, join_tokens(line, NULL));
+      continue;
+    }
+
+    // #pragma and #line change nothing this compiler can observe. Skipping
+    // them beats rejecting them, and both appear in real headers.
+    if (tok_is(tok, "pragma") || tok_is(tok, "line")) { tok = skip_line(tok); continue; }
+
+    error_at(tok->loc, "unknown directive #%s", tok_text(tok));
+  }
+
+  cur->next = tok;
+  return head.next;
+}
+
+// Translation phase 6: adjacent string literals become one. This is not a
+// preprocessor job in the standard's numbering, but it is the first point at
+// which both halves are visible, and the parser would otherwise see two
+// expressions side by side.
+static void join_adjacent_strings(Token *tok) {
+  for (; tok && tok->kind != TK_EOF; tok = tok->next) {
+    if (tok->kind != TK_STR || !tok->next || tok->next->kind != TK_STR) continue;
+
+    int len = tok->str_len - 1;
+    Token *t = tok->next;
+    for (; t->kind == TK_STR; t = t->next) len += t->str_len - 1;
+
+    char *buf = calloc(1, len + 1);
+    int pos = 0;
+    memcpy(buf, tok->str, tok->str_len - 1);
+    pos += tok->str_len - 1;
+    for (Token *u = tok->next; u->kind == TK_STR; u = u->next) {
+      memcpy(buf + pos, u->str, u->str_len - 1);
+      pos += u->str_len - 1;
+    }
+    tok->str = buf;
+    tok->str_len = len + 1;
+    tok->next = t;
+  }
+}
+
+static void add_include_path(char *path) {
+  if (n_include_paths == (int)(sizeof(include_paths) / sizeof(*include_paths)))
+    error("too many -I paths");
+  include_paths[n_include_paths++] = path;
+}
+
+// -DNAME, -DNAME=VALUE. Routed through the real #define parser rather than a
+// second one, so a command-line macro behaves exactly like a source-level one,
+// function-like forms included.
+static void define_from_cli(char *arg) {
+  char *eq = strchr(arg, '=');
+  char *text;
+  if (eq) {
+    text = malloc(strlen(arg) + 2);
+    memcpy(text, arg, eq - arg);
+    text[eq - arg] = ' ';
+    strcpy(text + (eq - arg) + 1, eq + 1);
+  } else {
+    text = malloc(strlen(arg) + 3);
+    sprintf(text, "%s 1", arg);
+  }
+  Token *t = tokenize_string("<command line>", text);
+  Token *rest;
+  read_macro_definition(&rest, t);
+}
+
+// Would printing b straight after a let them lex as something else? The
+// output of -E has to read back as the same token stream, and expansion
+// routinely puts two tokens next to each other that were never adjacent in
+// the source: "2" and "+" become "2+", which a pp-number happily swallows as
+// the start of an exponent.
+//
+// This is gcc's rule rather than a clever one. A pp-number is treated as
+// hazardous before any of digit, letter, '.', '+' or '-' without looking at
+// what the number actually is, because "1e" and "2" are the same kind of
+// token and only one of them is dangerous. Being conservative costs a space.
+static bool needs_space(Token *a, Token *b) {
+  if (!a || b->kind == TK_EOF) return false;
+  char bc = b->loc[0];
+
+  if (a->kind == TK_NUM)
+    return isdigit((unsigned char)bc) || is_ident1(bc) || bc == '.' || bc == '+' || bc == '-';
+
+  if (a->kind == TK_IDENT || a->kind == TK_KEYWORD)
+    return is_ident1(bc) || isdigit((unsigned char)bc);
+
+  if (a->kind == TK_PUNCT && b->kind == TK_PUNCT) {
+    // '/' then '/' or '*' would open a comment, which no punctuator table
+    // will tell you about.
+    if (a->loc[0] == '/' && (bc == '/' || bc == '*')) return true;
+
+    char glued[8];
+    int n = a->len + b->len;
+    if (n >= (int)sizeof(glued)) return false;
+    memcpy(glued, a->loc, a->len);
+    memcpy(glued + a->len, b->loc, b->len);
+    glued[n] = 0;
+    // If the longest punctuator at the join is longer than a was, the two
+    // have merged into a third thing: '+' '+' is '++'.
+    return read_punct(glued) > a->len;
+  }
+  return false;
+}
+
+// -E. Printed from the tokens rather than the text, because after expansion
+// there is no text: at_bol and has_space are the only record of the original
+// shape, which is exactly what they were kept for.
+static void print_tokens(Token *tok, char *path) {
+  FILE *o = (!path || !strcmp(path, "-")) ? stdout : fopen(path, "w");
+  if (!o) error("cannot write %s", path);
+
+  Token *prev = NULL;
+  for (; tok && tok->kind != TK_EOF; tok = tok->next) {
+    if (prev && tok->at_bol) fprintf(o, "\n");
+    else if (prev && (tok->has_space || needs_space(prev, tok))) fprintf(o, " ");
+    fprintf(o, "%.*s", tok->len, tok->loc);
+    prev = tok;
+  }
+  fprintf(o, "\n");
+  if (o != stdout) fclose(o);
+}
+
+// Translation phases 1 to 4. Deliberately stops there: string concatenation
+// and keyword recognition are phases 6 and 7, and -E must show the result of
+// phase 4 exactly. Folding them in here is what made `S(a) S(b)` print one
+// string -- the two literals were correctly concatenated, one phase too early
+// for anyone to see them.
+static Token *preprocess(Token *tok) {
+  init_macros();
+  tok = preprocess2(tok);
+  if (cond_incl)
+    error_at(cond_incl->tok->loc, "unterminated conditional directive");
+  return tok;
+}
+
 // ---------------------------------------------------------------- code output
 
 static FILE *out;
@@ -2274,7 +3299,10 @@ static void run(char **argv) {
 }
 
 static void usage(int status) {
-  fprintf(stderr, "usage: cc [-S] [-o OUT] FILE.c\n");
+  fprintf(stderr,
+      "usage: cc [-E] [-S] [-o OUT] [-Idir] [-Dname[=val]] [-Uname] FILE.c\n"
+      "  -E  preprocess only, and print the token stream\n"
+      "  -S  compile to assembly, do not assemble or link\n");
   exit(status);
 }
 
@@ -2282,10 +3310,30 @@ int main(int argc, char **argv) {
   char *input = NULL;
   char *output = NULL;
   bool asm_only = false;
+  bool preproc_only = false;
 
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--help")) usage(0);
     if (!strcmp(argv[i], "-S")) { asm_only = true; continue; }
+    if (!strcmp(argv[i], "-E")) { preproc_only = true; continue; }
+    if (!strcmp(argv[i], "-I")) {
+      if (++i == argc) usage(1);
+      add_include_path(argv[i]);
+      continue;
+    }
+    if (!strncmp(argv[i], "-I", 2)) { add_include_path(argv[i] + 2); continue; }
+    if (!strcmp(argv[i], "-D")) {
+      if (++i == argc) usage(1);
+      define_from_cli(argv[i]);
+      continue;
+    }
+    if (!strncmp(argv[i], "-D", 2)) { define_from_cli(argv[i] + 2); continue; }
+    if (!strcmp(argv[i], "-U")) {
+      if (++i == argc) usage(1);
+      undef_macro(argv[i]);
+      continue;
+    }
+    if (!strncmp(argv[i], "-U", 2)) { undef_macro(argv[i] + 2); continue; }
     if (!strcmp(argv[i], "-o")) {
       if (++i == argc) usage(1);
       output = argv[i];
@@ -2299,8 +3347,15 @@ int main(int argc, char **argv) {
 
   File *f = new_file(input, read_file(input));
 
-  Token *t = tokenize(f);
-  convert_keywords(t);
+  Token *t = preprocess(tokenize(f));
+
+  if (preproc_only) {
+    print_tokens(t, output);
+    return 0;
+  }
+
+  join_adjacent_strings(t);   // phase 6
+  convert_keywords(t);        // phase 7
   Obj *prog = parse(t);
 
   char *asm_path;
