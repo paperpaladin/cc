@@ -612,6 +612,30 @@ unimpl 'struct P { int x; }; int f(struct P p){ return p.x; } int main(void){ re
 unimpl 'struct P { int x; }; struct P g(void){ struct P p; p.x=1; return p; } int main(void){ return 0; }'
 unimpl 'int f(int a,int b,int c,int d,int e,int g,int h){ return h; } int main(void){ return f(1,2,3,4,5,6,7); }'
 
+# --- function pointers (PLAN 13)
+# "int (*fp)(int)" cannot be parsed in one pass: the suffix after the closing
+# paren describes what the thing inside points AT, so it has to be read first.
+check 0   'int g(int x){return x*2;} int main(){ int (*fp)(int) = g; return fp(3)-6; }'
+check 0   'int g(int x){return x*2;} int main(){ int (*fp)(int) = g; return (*fp)(3)-6; }'
+check 0   'int apply(int (*f)(int), int v){ return f(v); } int g(int x){return x+1;} int main(){ return apply(g,4)-5; }'
+check 0   'struct S { int (*f)(int); }; int g(int x){return x+2;} int main(){ struct S s; s.f = g; return s.f(5)-7; }'
+check 0   'struct S { int (*f)(int); }; int g(int x){return x+2;} int main(){ struct S s; struct S *p=&s; p->f=g; return p->f(5)-7; }'
+check 0   'int a(void){return 1;} int b(void){return 2;} int main(){ int (*t[2])(void); t[0]=a; t[1]=b; return t[0]()+t[1]()-3; }'
+check 0   'int g(int a,int b){return a*b;} int (*G)(int,int) = &g; int main(){ return G(3,4)-12; }'
+check 8   'int main(){ int (*fp)(int); return sizeof(fp); }'
+
+# A dispatch table, which is the shape this exists for.
+check 0   'int a(int x){return x+1;} int b(int x){return x*2;} int main(){ int (*t[2])(int); t[0]=a; t[1]=b; int s=0; int i; for(i=0;i<2;i=i+1) s=s+t[i](10); return s-31; }'
+
+# The call has to go THROUGH the pointer. Emitting a direct call to the
+# symbol named by the variable links cleanly and jumps to the pointer
+# itself, so this is a runtime check, not a compile-time one.
+check 7   'int g(void){return 7;} int main(){ int (*fp)(void)=g; int (*q)(void)=fp; return q(); }'
+
+# <stdlib.h> was the last system header, and it stopped on "void (*)(void)".
+check_src 0   '#include <stdlib.h>
+int main(void){ return 0; }'
+
 #__APPEND_BELOW__
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

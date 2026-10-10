@@ -103,9 +103,15 @@ possible, because the fixpoint is worth more than any individual feature.
 Everything remaining is ordered by what `cc.c` itself uses. Nothing here is
 speculative; each is a feature the compiler's own source needs.
 
-The preprocessor (07) is done. What `cc.c` still needs from the list below,
-by inspection of its own source: function prototypes, `static`, global
-initialisers, and variadic definitions for the error helpers.
+Everything up to 12d is done, and the list below has been **re-derived from
+`cc.c` itself** rather than left as written. Pointing the compiler at its own
+source and at `/usr/include` is a cheaper way to learn what is missing than
+reasoning about it, and it moved one item out of this milestone entirely and
+brought two in that were never on the list.
+
+What `cc.c` cannot compile about itself, in full: a function pointer as a
+struct member and as a parameter, and one compound literal with designated
+initialisers. That is the whole remaining distance to the fixpoint.
 
 - [x] 07 the preprocessor: `#include`, object and function macros, `#if`/`#ifdef`,
       token pasting, stringification, and the recursive-expansion hide-set rules
@@ -298,13 +304,57 @@ initialisers, and variadic definitions for the error helpers.
             so 18446744073709551615 silently became 9223372036854775807.
             strtoul: a literal is never negative here, since unary minus is
             its own node.
-- [ ] 13 struct arguments and returns -- the SysV eightbyte classification
+- [x] 13 function pointer declarators
+      why: **measured, not planned.** `cc.c` has exactly two things left that
+           it cannot compile about itself, and this is one of them:
+           `Token *(*builtin)(Token *tok)` as a struct member and as a
+           parameter. It is also the last thing standing between the
+           compiler and `<stdlib.h>`, which stops at
+           `void (*__func)(void)`. Needs recursive declarator parsing:
+           the name can be wrapped in parentheses and the suffixes bind
+           outward from it.
+      done: declarator() skips the parenthesised part, parses the suffix
+            that follows it to build the type the inside should be handed,
+            then goes back and reads the inside against that. Two passes
+            over a handful of tokens; the alternative is threading a
+            half-built type through the recursion.
+            A call became an operator in postfix() rather than something
+            only a bare name can do, which is what makes "m->builtin(tok)"
+            writable -- the shape cc.c uses. A function joined arrays and
+            aggregates in is_address_valued(), because its value is its
+            address; without that, loading a function designator emits
+            mov (%rax), %rax and dereferences its first instruction.
+      found: three bugs, all mine, all in the new code.
+            The callee is pushed after the arguments and so is on top, but
+            the arguments were popped first -- putting the callee in an
+            argument register and the last argument in %r10, then calling
+            whatever the argument happened to be.
+            Replacing consume("(") with peek("(") in primary() left the
+            cursor on the paren for every direct call. 45 cases failed, and
+            an earlier run of the suite had reported 291 passed against a
+            binary that had not been rebuilt. Rebuild, then read.
+      proves: 5 planted defects, 5 caught.
+- [ ] 14 compound literals with designated initialisers
+      why: the other one. `#define PRIM(k, sz, uns) &(Type){.kind = (k), ...}`
+           is how `cc.c` builds its ten primitive types, and it is C99 rather
+           than GNU C, so there is no way around it short of rewriting the
+           source to avoid it -- which would be arranging for the test to
+           pass rather than passing it.
+- [ ] 15 struct arguments and returns -- the SysV eightbyte classification
       why: the nastiest part of the ABI. Currently rejected with an explicit
-           error rather than miscompiled, which is the right interim answer.
+           error at the definition and the call rather than miscompiled,
+           which is the right interim answer, and `t/run.sh` asserts the
+           refusal with `unimpl()`.
+      note: **moved out of the self-host path.** `cc.c` passes zero structs
+            by value and returns zero, so this is not a prerequisite for the
+            fixpoint -- it was assumed to be one. It is still wanted for
+            `c-testsuite` and for `sqlite3.c`, which is where it belongs.
       proves: passing and returning structs of every size class across the gcc
               boundary
-- [ ] 14 integer promotion done properly, rather than the current approximation
-- [ ] 15 **self-host**: `cmp cc2 cc3` in CI
+- [ ] 16 integer promotion done properly, rather than the current approximation
+      note: the relational half of this turned out to be a real bug and was
+            fixed early, as 08b. What is left is the arithmetic half.
+- [ ] 17 **self-host**: `cmp cc2 cc3` in CI
       proves: the fixpoint invariant, from here to the end of the project
 
 - [x] 12c #include_next, and the compiler's answers about its own types
