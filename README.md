@@ -63,6 +63,11 @@ uninitialised stack.
 **Calls** -- definitions and calls up to 6 arguments, recursion, and calls into
 libc that get the ABI right.
 
+**`static` and `extern`** -- internal linkage on globals and functions,
+`extern` declarations that reference another translation unit without
+defining anything, and `static` locals, which have block scope and static
+storage and so are emitted as globals under a generated name.
+
 **Function prototypes** -- a declaration gives a call its return type, so
 `sizeof(f())` is right and a returned pointer can be dereferenced. Arguments
 are converted to their parameter types at the call, and the argument count is
@@ -87,7 +92,7 @@ A stray backslash outside a string literal is rejected rather than carried
 along as a preprocessing token, which is legal C that real preprocessors
 accept; nothing here needs it, and the tokenizer is simpler without it.
 
-No `float` or `double`. No `static` or `extern` linkage. No bitfields. No variadic function
+No `float` or `double`. No bitfields. No variadic function
 *definitions* (calling a variadic function works). Passing or returning a struct
 **by value** is rejected with an explicit error rather than silently
 miscompiled -- that needs the SysV eightbyte classification algorithm, which is

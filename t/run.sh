@@ -329,6 +329,53 @@ check 1   'int main(){ unsigned int u = 1; long l = -1; return l < u; }'
 check 0   'int main(){ unsigned int u = 1; long l = -1; return l > u; }'
 check 0   'int main(){ int a=-1; return a > 5; }'
 
+# --- static and extern (PLAN 09)
+check 3   'int tick(void){ static int n; n=n+1; return n; } int main(){ tick(); tick(); return tick(); }'
+check 5   'int f(int n){ static int s; s=s+n; return s; } int main(){ f(2); return f(3); }'
+check 3   'int f(void){ static int a[3]; a[0]=a[0]+1; return a[0]; } int main(){ f(); f(); return f(); }'
+check 7   'static int g; int main(){ g=7; return g; }'
+check 5   'static int f(void){ return 5; } int main(){ return f(); }'
+check 0   'extern int errno; int main(){ return 0; }'
+
+# Two functions each with a static called "n" are two objects. Without the
+# mangling they would be one label and this returns 23, not 22.
+check 22  'int a(void){ static int n; n=n+1; return n; } int b(void){ static int n; n=n+10; return n; } int main(){ a(); b(); return a()+b(); }'
+
+# A static local is still block-scoped: the name does not escape the function.
+refuse 'int f(void){ static int hidden; return hidden; } int main(){ return hidden; }'
+
+# Internal linkage cannot be tested in one file. A static global works exactly
+# the same as a public one until something else defines that name too, so this
+# is the only case that can tell the difference: two translation units, each
+# with its own "g", linked together. Emit .globl for both and the linker folds
+# them into one object, set_b overwrites set_a, and the answer is 22.
+link_static_test() {
+  d=$T.linkdir
+  rm -rf "$d"; mkdir -p "$d"
+  printf 'static int g;\nint set_a(int v){ g=v; return g; }\nint get_a(void){ return g; }\n' > "$d/a.c"
+  printf 'static int g;\nint set_b(int v){ g=v; return g; }\nint get_b(void){ return g; }\n' > "$d/b.c"
+  printf 'int set_a(int); int get_a(void); int set_b(int); int get_b(void);\nint main(void){ set_a(1); set_b(2); return get_a()*10 + get_b(); }\n' > "$d/m.c"
+  for f in a b m; do
+    ./cc -S "$d/$f.c" -o "$d/$f.s" 2> "$d/err" || {
+      fail=$((fail + 1)); printf 'FAIL (compile) static linkage: %s.c\n' "$f"; rm -rf "$d"; return; }
+  done
+  if ! gcc -static "$d/a.s" "$d/b.s" "$d/m.s" -o "$d/bin" 2> "$d/lderr"; then
+    fail=$((fail + 1))
+    printf 'FAIL (link) two files each defining "static int g"\n'
+    sed 's/^/        /' "$d/lderr"
+    rm -rf "$d"; return
+  fi
+  "$d/bin"; got=$?
+  if [ "$got" = 12 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  two files each defining "static int g"\n        expected 12, got %s\n' "$got"
+  fi
+  rm -rf "$d"
+}
+link_static_test
+
 #__APPEND_BELOW__
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
