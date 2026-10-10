@@ -38,6 +38,35 @@ check() {
   fi
 }
 
+# Valid C that this compiler deliberately does not implement. The opposite
+# of refuse(): gcc must ACCEPT it, and we must reject it cleanly rather than
+# miscompile it. Worth asserting rather than leaving in a README, because the
+# failure mode of an unimplemented feature is not a missing error message --
+# it is silently generating wrong code for something that looked close
+# enough. If one of these ever starts passing, that is the thing to check.
+unimpl() {
+  src="$1"
+  printf '%s' "$src" > "$T.c"
+  "$CCBIN" "$T.c" -o "$T.bin" 2> "$T.err"
+  rc=$?
+  if [ "$rc" = 0 ]; then
+    fail=$((fail + 1))
+    printf 'FAIL (accepted something we do not implement) %s\n' "$src"
+    return
+  fi
+  if [ "$rc" != 1 ]; then
+    fail=$((fail + 1))
+    printf 'FAIL (exit %s, not a clean refusal) %s\n' "$rc" "$src"
+    return
+  fi
+  if ! gcc -w -c "$T.c" -o /dev/null 2> /dev/null; then
+    fail=$((fail + 1))
+    printf 'FAIL (not valid C, so refuse() is the right helper) %s\n' "$src"
+    return
+  fi
+  pass=$((pass + 1))
+}
+
 # A case whose source spans more than one line. t/differential.sh pulls cases
 # out of this file with `grep '^check '`, one line at a time, so a multi-line
 # check would reach it as an unterminated quote and break the whole run. The
@@ -564,6 +593,24 @@ check_src 8   '#include <limits.h>
 int main(void){ return CHAR_BIT; }'
 check_src 1   '#include <stdbool.h>
 int main(void){ bool b = true; return b; }'
+
+# The whole point of all of the above: a program that uses real glibc
+# through its real headers.
+check_src 0   '#include <stdio.h>
+#include <string.h>
+int main(void){ char b[64]; sprintf(b, "%d/%s", 42, "real"); return strcmp(b, "42/real"); }'
+
+# float and double are declarable but not operable. A header may name them
+# all it likes -- glibc reaches "typedef float _Float32" on the way to
+# printf -- and producing a value of one is a named error rather than a
+# silent miscompilation.
+check 12  'typedef float F32; double sqrt(double); int main(void){ return sizeof(float)+sizeof(double); }'
+check 16  'int main(void){ return sizeof(long double); }'
+unimpl 'int main(void){ double d = 1; return 0; }'
+unimpl 'int main(void){ float f; f = 1; return 0; }'
+unimpl 'struct P { int x; }; int f(struct P p){ return p.x; } int main(void){ return 0; }'
+unimpl 'struct P { int x; }; struct P g(void){ struct P p; p.x=1; return p; } int main(void){ return 0; }'
+unimpl 'int f(int a,int b,int c,int d,int e,int g,int h){ return h; } int main(void){ return f(1,2,3,4,5,6,7); }'
 
 #__APPEND_BELOW__
 
