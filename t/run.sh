@@ -33,6 +33,26 @@ check() {
   fi
 }
 
+# A program cc must refuse. gcc has to refuse it too, because "cc rejects
+# this" is an opinion until something outside this repo agrees: a compiler that
+# invents its own errors is as broken as one that misses real ones, and only
+# the second kind gets noticed without this check.
+refuse() {
+  src="$1"
+  printf '%s' "$src" > "$T.c"
+  if ./cc "$T.c" -o "$T.bin" 2> "$T.err"; then
+    fail=$((fail + 1))
+    printf 'FAIL (accepted, should refuse) %s\n' "$src"
+    return
+  fi
+  if gcc -w -c "$T.c" -o /dev/null 2> /dev/null; then
+    fail=$((fail + 1))
+    printf 'FAIL (we refuse it but gcc accepts it) %s\n' "$src"
+    return
+  fi
+  pass=$((pass + 1))
+}
+
 # --- literals and arithmetic
 check 0  'int main() { return 0; }'
 check 42 'int main() { return 42; }'
@@ -233,7 +253,53 @@ check 6   'int main() { int a[2][2] = {{1,2},{0,3}}; return a[0][0]+a[0][1]+a[1]
 check 3   'int main() { int a[3] = {1,2,3,}; return a[2]; }'
 check 1   'int main() { char *p = "hi"; return p[0] == 104; }'
 check 15  'int main() { int a[3] = {1,2,3}; int s=0; int i; for(i=0;i<3;i=i+1) s=s+a[i]; int b[2]={4,5}; s=s+b[0]+b[1]; return s; }'
+# --- function prototypes (PLAN 08)
+# The call's type now comes from the declaration instead of being assumed to
+# be long. sizeof is the cleanest way to see it, and dereferencing a returned
+# pointer is the case that could not be written at all before.
+check 4   'int f(void){return 1;} int main(){ return sizeof(f()); }'
+check 8   'char *s(void){return "x";} int main(){ return sizeof(s()); }'
+check 101 'char *s(void){return "hello";} int main(){ return *(s()+1); }'
+check 1   'char *s(void){return "hello";} int main(){ return s()[0] == 104; }'
+check 44  'int f(void){return 300;} int main(){ char c = f(); return c; }'
+check 200 'unsigned char f(void){return 200;} int main(){ return f(); }'
+check 0   'int fact(int n){return n<2?1:n*fact(n-1);} int main(){ return fact(5)-120; }'
+
+# Arguments are converted at the call, as if by assignment.
+#
+# The narrowing direction cannot test this, and the first version of these
+# cases got it wrong: g(300) returns 44 whether or not the call converts,
+# because the callee stores its parameter into a one-byte slot and truncates
+# it anyway. Deleting the conversion left the whole suite green.
+#
+# Widening is the direction that discriminates. An int sitting in a register
+# says nothing about its top 32 bits, so passing one to a long parameter is
+# only correct if someone sign-extends it, and the callee is too late.
+check 1   'int f(long x){return x==-1;} int main(){ int i=-1; return f(i); }'
+check 1   'int f(long x){return x==-2;} int main(){ int i=-2; return f(i); }'
+check 44  'int g(char c){return c;} int main(){ return g(300); }'
+
+# A prototype, then the definition. One function, not two.
+check 0   'int f(int); int main(){ return f(3); } int f(int x){ return x*2-6; }'
+check 0   'int add(int,int); int main(){ return add(2,3)-5; } int add(int a,int b){ return a+b; }'
+
+# Unnamed parameters still occupy their argument register, so the ones after
+# them must not shift down into it.
+check 0   'int h(int a, int, int c){ return a+c; } int main(){ return h(1,9,2)-3; }'
+check 0   'int f(int, int b){ int z=3; return z+b; } int main(){ return f(1,4)-7; }'
+
+# What a prototype buys: the call is checked.
+refuse 'int f(int a, int b); int main(){ return f(1); } int f(int a,int b){return a+b;}'
+refuse 'int f(int a); int main(){ return f(1,2); } int f(int a){return a;}'
+refuse 'int f(void); int main(){ return f(1); } int f(void){return 0;}'
+refuse 'int f(void); char f(void){return 1;} int main(){return 0;}'
+
+# ...and what an empty parameter list does not buy. "f()" declares nothing
+# about its arguments, so it must not be checked; "f(void)" must.
+check 0   'int f(); int main(){ return f(1,2,3); } int f(int a,int b,int c){ return a+b+c-6; }'
+
 #__APPEND_BELOW__
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 rm -f "$T.c" "$T.bin" "$T.err"
 [ "$fail" = 0 ]

@@ -102,7 +102,37 @@ initialisers, and variadic definitions for the error helpers.
             The GNU note above has not been tested yet. Nothing here has met
             /usr/include, and item 15 is where that bill arrives.
       proves: 7 planted defects, 7 caught -- see the table in the README.
-- [ ] 08 function prototypes, so a call stops assuming a `long` return
+- [x] 08 function prototypes, so a call stops assuming a `long` return
+      done: the declaration side already parsed; the call site was the gap.
+            A function now goes into the file scope (it was only ever added
+            to the globals list, so find_name could not see it), a call takes
+            its type from the declaration, arguments are converted as if by
+            assignment, and the count is checked. A prototype followed by a
+            definition is one Obj, not two.
+            `f(void)` and `f()` are deliberately not the same: both produce an
+            empty parameter list, so has_proto records which one was written
+            or the difference is lost and `f()` starts rejecting its own
+            callers. Unnamed parameters had to be allowed -- `int f(int);` is
+            what every header writes -- and that immediately crashed, because
+            an unnamed Obj was still being pushed into the scope and the first
+            lookup that scanned past it called strlen(NULL).
+            An undeclared call still assumes `long`. C89's implicit int would
+            truncate a pointer from an undeclared malloc, and the suite calls
+            printf and strlen with no declaration.
+      proves: 7 planted defects. Six caught; the survivor is the interesting
+            one and is written up in the README. "Arguments are converted at
+            the call" was being tested by g(300) against int g(char), which
+            returns 44 either way because the callee truncates into its own
+            one-byte slot. Narrowing cannot see a call-site conversion. The
+            widening case can, and kills the mutant.
+      note: finding that turned up an unrelated miscompilation -- unsigned
+            relational comparison uses the signed condition codes, so
+            `unsigned x = -1; x > 0` is 0. Item 08b below.
+- [ ] 08b unsigned relational operators use the unsigned condition codes
+      why: `unsigned x = -1; x > 0` returns 0 and should return 1. Division
+           and equality are already right, so this is only the four
+           relational forms. Found while building the prototype cases, not
+           by anything that was looking for it.
 - [ ] 09 `static` and `extern` linkage, and `static` locals
 - [ ] 10 global initialisers (`int x = 5;` at file scope, and string pointers)
       why: currently every global is `.zero`-filled
