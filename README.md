@@ -89,6 +89,14 @@ uninitialised stack.
 **Calls** -- definitions and calls up to 6 arguments, recursion, and calls into
 libc that get the ABI right.
 
+**Structs by value**, up to 16 bytes -- passed in one or two integer
+registers, returned in `rax:rdx`, checked in both directions across a `gcc`
+boundary. The full SysV classification walks every field because a `double`
+lands in a different register file; this compiler has none, so the
+algorithm collapses to a size check -- with the one hole that `float` and
+`double` are *declarable* here, so a struct containing one is refused
+rather than quietly passed in the wrong place.
+
 **Function pointers** -- declaring, assigning, passing, returning through,
 arrays of them, and calling through one from a struct member. Needed
 recursive declarator parsing, because `int (*fp)(int)` cannot be read in one
@@ -145,15 +153,20 @@ accept; nothing here needs it, and the tokenizer is simpler without it.
 declarable -- they parse, size correctly at 4, 8 and 16, and appear in
 declarations, which is what real headers need -- but producing a value of
 one is an error rather than a silent miscompilation. No `va_arg` of a
-struct. `const`, `volatile` and `restrict` parse and are then ignored;
-there is no const-checking here, and saying so is better than implying
-there is.
-A call may pass at most six arguments (a definition may *receive* more than
-six through `va_arg`, which is how the overflow path gets tested at all). No variadic function
-*definitions* (calling a variadic function works). Passing or returning a struct
-**by value** is rejected with an explicit error rather than silently
-miscompiled -- that needs the SysV eightbyte classification algorithm, which is
-its own milestone.
+struct.
+
+`const`, `volatile` and `restrict` parse and are then ignored; there is no
+const-checking here, and saying so is better than implying there is.
+
+**A call may pass at most six arguments**, because there is no support for
+arguments on the stack. A *definition* may receive more than six through
+`va_arg`, which is how that path gets tested at all -- gcc makes the call.
+The same gap is why a struct larger than 16 bytes cannot be passed by
+value: that is the MEMORY class, and it needs the thing that is missing.
+Every one of these is refused by name, and `t/run.sh` asserts the refusal
+with `unimpl()` -- gcc must accept the program and we must reject it
+cleanly, because the failure mode of a missing feature is not a missing
+error message but quietly wrong code for something that looked close enough.
 
 It compiles itself. See the top of this file.
 
@@ -236,12 +249,12 @@ the published torture tests for rescanning, `#`, `##` and variadic macros.
 
 ```
 $ make test
-237 passed, 0 failed
-56 passed, 0 failed
+319 passed, 0 failed
+64 passed, 0 failed
 
 $ make test-asan        # the same suite, watched
-237 passed, 0 failed
-56 passed, 0 failed
+319 passed, 0 failed
+64 passed, 0 failed
 ```
 
 `make test-asan` rebuilds the compiler with AddressSanitizer and

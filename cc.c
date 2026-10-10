@@ -554,6 +554,9 @@ struct Node {
   Node *args;
   Obj *fn;         // the declaration, when there is one
   Node *callee;    // indirect call: the expression yielding the address
+  Obj *ret_buf;    // a call returning a small aggregate needs somewhere to
+                   // put it: the value arrives in rax:rdx, but every
+                   // aggregate in this compiler is addressed, not held.
 
   Member *member;  // ND_MEMBER
 
@@ -611,6 +614,22 @@ static Node *new_var_node(Obj *var, Token *tok) {
 }
 
 // Propagate types bottom-up. Called once per node after it is built.
+// What may appear on the left of an assignment. Deliberately a whitelist:
+// anything not named here is not assignable, which is the safe direction to
+// be wrong in.
+static bool is_lvalue(Node *n) {
+  switch (n->kind) {
+  case ND_VAR:
+  case ND_DEREF:
+  case ND_MEMBER:
+    return true;
+  case ND_COMMA:
+    return is_lvalue(n->rhs);
+  default:
+    return false;
+  }
+}
+
 static void add_type(Node *n) {
   if (!n || n->ty) return;
 
@@ -632,6 +651,12 @@ static void add_type(Node *n) {
     return;
   case ND_ASSIGN:
     if (n->lhs->ty->kind == TY_ARRAY) error_at(n->tok->loc, "not an lvalue");
+    // Assignability is a question about the expression, not about whether
+    // codegen can produce an address for it. gen_addr() will happily give
+    // the address of a struct-returning call, because that is how such a
+    // call is passed on to something else -- but "f() = x" is still not C.
+    if (!is_lvalue(n->lhs))
+      error_at(n->tok->loc, "lvalue required as the left operand of assignment");
     if (is_aggregate(n->lhs->ty) && n->lhs->ty != n->rhs->ty &&
         n->lhs->ty->size != n->rhs->ty->size)
       error_at(n->tok->loc, "incompatible types in struct assignment");
@@ -838,6 +863,7 @@ static Node *stmt(void);
 static Node *compound_stmt(void);
 static long eval(Node *n);
 static bool in_function_body;
+static int aggregate_regs(Type *ty);
 static Type *declspec(VarAttr *attr);
 static Type *declarator(Type *ty, char **name);
 static Type *struct_union_decl(void);
@@ -1402,6 +1428,18 @@ static void init_walk(Node *base, Type *ty, Node **cur, Token *tok) {
   }
 
   if (is_aggregate(ty)) {
+    // "struct P a = f();" initialises from a value rather than a list. The
+    // brace form was the only one handled, so a struct-returning call could
+    // be assigned but not used to initialise -- a distinction C does not
+    // make and nothing would expect.
+    if (!peek("{")) {
+      Node *rhs = assign();
+      add_type(rhs);
+      if (!is_aggregate(rhs->ty) || rhs->ty->size != ty->size)
+        error_at(tok->loc, "cannot initialise this struct or union from that value");
+      *cur = (*cur)->next = as_stmt(base, rhs, tok);
+      return;
+    }
     expect("{");
     Member *m = ty->members;
     bool first = true;
@@ -1708,13 +1746,19 @@ static Node *funcall(char *name, Token *tok) {
     add_type(arg);
 
     if (param) {
-      if (is_aggregate(param->ty))
-        error_at(atok->loc, "passing a struct or union by value is not supported yet "
-                            "(needs SysV eightbyte classification; see PLAN.md)");
+      if (is_aggregate(param->ty) && !aggregate_regs(param->ty))
+        error_at(atok->loc, "passing a %d-byte struct or union by value is not "
+                            "supported (the MEMORY class needs stack arguments; "
+                            "see PLAN.md)", param->ty->size);
       // Converted as if by assignment, which is the whole point of having the
       // prototype: f(char) called with an int must narrow at the call, not
       // inside the callee where the value has already arrived wrong.
-      arg = new_cast(arg, param->ty);
+      //
+      // An aggregate is exempt. There is no conversion to apply -- the types
+      // have to match already -- and wrapping it in a cast turns the
+      // argument into a non-lvalue, which is a problem because passing a
+      // struct by value starts by taking its address.
+      if (!is_aggregate(param->ty)) arg = new_cast(arg, param->ty);
       param = param->next;
     } else if (fn && fn->has_proto && !fn->is_variadic) {
       error_at(atok->loc, "too many arguments to '%s'", name);
@@ -1734,6 +1778,15 @@ static Node *funcall(char *name, Token *tok) {
   n->args = head.next;
   n->fn = fn;
   (void)nargs;
+
+  Type *ret = fn ? fn->ty->ret : NULL;
+  if (ret && is_aggregate(ret)) {
+    if (!aggregate_regs(ret))
+      error_at(tok->loc, "a call returning a %d-byte struct or union is not "
+                         "supported (the MEMORY class needs the hidden-pointer "
+                         "protocol; see PLAN.md)", ret->size);
+    n->ret_buf = new_var("", ret, true);
+  }
   return n;
 }
 
@@ -2388,14 +2441,14 @@ static Obj *function(Type *base, VarAttr *attr) {
   // that merely includes <stdio.h> is asking to call it. A definition is
   // different, because this is where the argument would have to be received.
   for (Obj *pp = fn->params; pp; pp = pp->next)
-    if (is_aggregate(pp->ty))
-      error_at(tk->loc, "defining a function that takes a struct or union by value "
-                        "is not supported yet (needs SysV eightbyte "
-                        "classification; see PLAN.md)");
-  if (is_aggregate(ty))
-    error_at(tk->loc, "defining a function that returns a struct or union by value "
-                      "is not supported yet (needs SysV eightbyte "
-                      "classification; see PLAN.md)");
+    if (is_aggregate(pp->ty) && !aggregate_regs(pp->ty))
+      error_at(tk->loc, "a %d-byte struct or union parameter is not supported "
+                        "(the MEMORY class needs stack arguments; see PLAN.md)",
+               pp->ty->size);
+  if (is_aggregate(ty) && !aggregate_regs(ty))
+    error_at(tk->loc, "returning a %d-byte struct or union is not supported "
+                      "(the MEMORY class needs the hidden-pointer protocol; "
+                      "see PLAN.md)", ty->size);
 
   expect("{");
   fn->is_definition = true;
@@ -3688,6 +3741,32 @@ static void pop(char *reg) { emit("pop %s", reg); depth--; }
 
 // Argument registers in SysV order, at each width. A table beats doing string
 // surgery on "%rdi" to get "%dil" at every call site.
+// How many integer registers a by-value aggregate occupies, or 0 for the
+// MEMORY class, which this compiler does not pass.
+//
+// The full SysV classification algorithm walks every field and merges a
+// class per eightbyte, because a double lands in an SSE register and an int
+// does not. This compiler has no floating-point registers at all, so every
+// field that can hold a value is INTEGER and the algorithm collapses to a
+// size check -- with one hole that has to be closed by hand: float and
+// double are *declarable* here (real headers need them), so a struct
+// containing one would be classified SSE by anyone else and must be refused
+// rather than quietly passed in the wrong register file.
+static bool has_fp_member(Type *ty) {
+  if (ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE) return true;
+  if (ty->kind == TY_ARRAY) return has_fp_member(ty->base);
+  if (is_aggregate(ty))
+    for (Member *m = ty->members; m; m = m->next)
+      if (has_fp_member(m->ty)) return true;
+  return false;
+}
+
+static int aggregate_regs(Type *ty) {
+  if (ty->size > 16) return 0;            // MEMORY: passed on the stack
+  if (has_fp_member(ty)) return 0;        // SSE class, which we cannot do
+  return (ty->size + 7) / 8;              // one or two INTEGER eightbytes
+}
+
 static char *ARGREG64[] = {"%rdi", "%rsi", "%rdx", "%rcx", "%r8",  "%r9"};
 static char *ARGREG32[] = {"%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"};
 static char *ARGREG16[] = {"%di",  "%si",  "%dx",  "%cx",  "%r8w", "%r9w"};
@@ -3715,6 +3794,12 @@ static void gen_addr(Node *n) {
     gen_addr(n->rhs);
     return;
   default:
+    // An aggregate expression always evaluates to its own address here, so
+    // for one of those "take the address" and "evaluate" are the same
+    // instruction sequence. That is what lets a struct-returning call be
+    // used where a struct is wanted -- id(id(a)) -- even though a call is
+    // not an lvalue in C and cannot be assigned to.
+    if (n->ty && is_aggregate(n->ty)) { gen_expr(n); return; }
     error_at(n->tok->loc, "not an lvalue");
   }
 }
@@ -4012,13 +4097,45 @@ static void gen_expr(Node *n) {
     return;
   }
   case ND_FUNCALL: {
+    // One argument is no longer one register: a small aggregate occupies
+    // one or two. Eightbytes are pushed left to right in the order the
+    // registers want them, so popping the whole run in reverse still lands
+    // each one where it belongs.
     int nargs = 0;
     for (Node *a = n->args; a; a = a->next) {
+      if (is_aggregate(a->ty)) {
+        int regs = aggregate_regs(a->ty);
+        if (!regs)
+          error_at(a->tok->loc, "passing a %d-byte struct or union by value is not "
+                                "supported (the MEMORY class needs stack arguments; "
+                                "see PLAN.md)", a->ty->size);
+        gen_addr(a);
+        emit("mov %%rax, %%r11");          // the object; %r11 survives push()
+        for (int i = 0; i < regs; i++) {
+          int rest = a->ty->size - i * 8;
+          if (rest >= 8) {
+            emit("mov %d(%%r11), %%rax", i * 8);
+          } else {
+            // Assemble the tail byte by byte rather than reading a full
+            // eightbyte past the end of the object. The bytes beyond it
+            // belong to something else, and under ASan that is a report.
+            emit("xor %%eax, %%eax");
+            for (int k = rest - 1; k >= 0; k--) {
+              emit("shl $8, %%rax");
+              emit("movzbl %d(%%r11), %%ecx", i * 8 + k);
+              emit("or %%rcx, %%rax");
+            }
+          }
+          push();
+          nargs++;
+        }
+        continue;
+      }
       gen_expr(a);
       push();
       nargs++;
     }
-    if (nargs > 6) error_at(n->tok->loc, "more than 6 arguments is not supported");
+    if (nargs > 6) error_at(n->tok->loc, "more than 6 argument registers is not supported");
 
     // The callee address is computed before the argument registers are
     // loaded, and parked on the stack: evaluating it could call something
@@ -4041,6 +4158,32 @@ static void gen_expr(Node *n) {
     if (n->callee) emit("call *%%r10");
     else           emit("call %s", n->funcname);
     if (depth % 2 != 0) emit("add $8, %%rsp");
+
+    // A returned aggregate arrives in rax:rdx, but every aggregate here is
+    // addressed rather than held, so it is written into a hidden local and
+    // the call's value becomes that local's address.
+    if (n->ret_buf) {
+      int sz = n->ret_buf->ty->size;
+      for (int i = 0; i < (sz + 7) / 8; i++) {
+        char *src64 = (i == 0) ? "%rax" : "%rdx";
+        char *src32 = (i == 0) ? "%eax" : "%edx";
+        char *src16 = (i == 0) ? "%ax"  : "%dx";
+        char *src8  = (i == 0) ? "%al"  : "%dl";
+        int rest = sz - i * 8, off = n->ret_buf->offset + i * 8;
+        if (rest >= 8)      emit("mov %s, %d(%%rbp)", src64, off);
+        else if (rest == 4) emit("mov %s, %d(%%rbp)", src32, off);
+        else if (rest == 2) emit("mov %s, %d(%%rbp)", src16, off);
+        else if (rest == 1) emit("mov %s, %d(%%rbp)", src8,  off);
+        else {
+          emit("mov %s, %%r11", src64);
+          int done = 0;
+          if (rest >= 4) { emit("mov %%r11d, %d(%%rbp)", off); emit("shr $32, %%r11"); done = 4; }
+          if (rest - done >= 2) { emit("mov %%r11w, %d(%%rbp)", off + done); emit("shr $16, %%r11"); done += 2; }
+          if (rest - done >= 1) { emit("mov %%r11b, %d(%%rbp)", off + done); }
+        }
+      }
+      emit("lea %d(%%rbp), %%rax", n->ret_buf->offset);
+    }
     return;
   }
   default:
@@ -4119,7 +4262,30 @@ static void gen_stmt(Node *n) {
     gen_expr(n->lhs);
     return;
   case ND_RETURN:
-    if (n->lhs) gen_expr(n->lhs);   // "return;" has nothing to evaluate
+    if (n->lhs) {
+      gen_expr(n->lhs);
+      // An aggregate expression yields its address, so returning one means
+      // loading the eightbytes the ABI wants in rax and rdx. Done here and
+      // not at the epilogue because only this node knows what is returned.
+      if (is_aggregate(n->lhs->ty)) {
+        int sz = n->lhs->ty->size;
+        emit("mov %%rax, %%r11");
+        for (int i = 0; i < (sz + 7) / 8; i++) {
+          char *dst = (i == 0) ? "%rax" : "%rdx";
+          int rest = sz - i * 8;
+          if (rest >= 8) {
+            emit("mov %d(%%r11), %s", i * 8, dst);
+          } else {
+            emit("xor %s, %s", (i == 0) ? "%eax" : "%edx", (i == 0) ? "%eax" : "%edx");
+            for (int k = rest - 1; k >= 0; k--) {
+              emit("shl $8, %s", dst);
+              emit("movzbl %d(%%r11), %%ecx", i * 8 + k);
+              emit("or %%rcx, %s", dst);
+            }
+          }
+        }
+      }
+    }
     emit("jmp .L.return.%s", current_fn->name);
     return;
   case ND_IF: {
@@ -4292,14 +4458,41 @@ static void emit_text(Obj *globals_) {
       for (int i = 0; i < 6; i++)
         emit("mov %s, %d(%%rbp)", ARGREG64[i], fn->va_area + i * 8);
 
-    // fn->params is already in declaration order, so param k lives in
-    // ARGREG*[k]. Spill each to its stack slot on entry.
+    // fn->params is in declaration order, so the registers are consumed in
+    // that order too -- but a small aggregate consumes one or two of them,
+    // so the index advances by what each parameter actually takes rather
+    // than by one.
     int k = 0;
-    for (Obj *p = fn->params; p && k < 6; p = p->next, k++) {
+    for (Obj *p = fn->params; p; p = p->next) {
+      if (is_aggregate(p->ty)) {
+        int regs = aggregate_regs(p->ty);
+        for (int i = 0; i < regs && k < 6; i++, k++) {
+          int rest = p->ty->size - i * 8;
+          int off = p->offset + i * 8;
+          // The tail is written at its real width. Storing a full eightbyte
+          // for a 12-byte struct would trample whatever follows it in the
+          // frame, which is a different local.
+          if (rest >= 8)      emit("mov %s, %d(%%rbp)", ARGREG64[k], off);
+          else if (rest == 4) emit("mov %s, %d(%%rbp)", ARGREG32[k], off);
+          else if (rest == 2) emit("mov %s, %d(%%rbp)", ARGREG16[k], off);
+          else if (rest == 1) emit("mov %s, %d(%%rbp)", ARGREG8[k],  off);
+          else {
+            // 3, 5, 6 or 7 bytes: store the widest pieces that fit.
+            emit("mov %s, %%r11", ARGREG64[k]);
+            int done = 0;
+            if (rest >= 4) { emit("mov %%r11d, %d(%%rbp)", off); emit("shr $32, %%r11"); done = 4; }
+            if (rest - done >= 2) { emit("mov %%r11w, %d(%%rbp)", off + done); emit("shr $16, %%r11"); done += 2; }
+            if (rest - done >= 1) { emit("mov %%r11b, %d(%%rbp)", off + done); }
+          }
+        }
+        continue;
+      }
+      if (k >= 6) break;
       if (p->ty->size == 1)      emit("mov %s, %d(%%rbp)", ARGREG8[k],  p->offset);
       else if (p->ty->size == 2) emit("mov %s, %d(%%rbp)", ARGREG16[k], p->offset);
       else if (p->ty->size == 4) emit("mov %s, %d(%%rbp)", ARGREG32[k], p->offset);
       else                       emit("mov %s, %d(%%rbp)", ARGREG64[k], p->offset);
+      k++;
     }
 
     gen_stmt(fn->body);

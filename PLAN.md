@@ -344,7 +344,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
            than GNU C, so there is no way around it short of rewriting the
            source to avoid it -- which would be arranging for the test to
            pass rather than passing it.
-- [ ] 15 struct arguments and returns -- the SysV eightbyte classification
+- [x] 15 struct arguments and returns -- the SysV eightbyte classification
       why: the nastiest part of the ABI. Currently rejected with an explicit
            error at the definition and the call rather than miscompiled,
            which is the right interim answer, and `t/run.sh` asserts the
@@ -353,8 +353,66 @@ initialisers. That is the whole remaining distance to the fixpoint.
             by value and returns zero, so this is not a prerequisite for the
             fixpoint -- it was assumed to be one. It is still wanted for
             `c-testsuite` and for `sqlite3.c`, which is where it belongs.
-      proves: passing and returning structs of every size class across the gcc
-              boundary
+      done: up to 16 bytes, in one or two integer registers, both
+            directions. The classification collapses to a size check
+            because there are no floating-point registers here -- with one
+            hole closed by hand: float and double are declarable, so a
+            struct containing one would be SSE class to anyone else and is
+            refused rather than passed in the wrong register file.
+            A ragged tail is read and written at its real width. Loading a
+            full eightbyte for a 12-byte struct reads four bytes belonging
+            to the next local; writing one tramples them.
+            Returns arrive in rax:rdx and are parked in a hidden local,
+            because every aggregate here is addressed rather than held.
+            Three things fell out that had nothing to do with the ABI: an
+            aggregate argument must not be wrapped in a cast (no conversion
+            applies, and the cast made it a non-lvalue exactly where its
+            address was needed); "struct P a = f();" was unsupported while
+            "a = f();" worked, which is not a distinction C makes; and
+            gen_addr() falls back to gen_expr() for any aggregate, which is
+            what lets id(id(a)) work -- with an explicit lvalue whitelist
+            added at parse time so "f() = x" is still refused, because
+            being addressable and being assignable are different questions
+            and codegen was about to answer both with the first.
+      limit: >16 bytes stays refused. That is the MEMORY class, it needs
+            arguments on the stack, and this compiler has none -- the same
+            gap that caps every call at six arguments.
+      proves: 7 planted defects, 7 caught. The oracle is a program whose
+            driver GCC compiles: gcc generates the calls into our functions
+            and receives our returns, and we call and receive gcc's. A
+            calling convention can be self-consistently wrong -- our caller
+            agreeing with our callee proves nothing -- so only something
+            that was not told what we decided can say whether it is right.
+      done: up to 16 bytes, in one or two integer registers, both directions.
+            The classification collapses to a size check because there are
+            no floating-point registers here -- with one hole closed by
+            hand: float and double are declarable, so a struct containing
+            one would be SSE class to anyone else and is refused rather
+            than passed in the wrong register file.
+            A ragged tail is read and written at its real width. Loading a
+            full eightbyte for a 12-byte struct reads four bytes that
+            belong to another local, and writing one tramples them.
+            Returns arrive in rax:rdx and are parked in a hidden local,
+            because every aggregate here is addressed rather than held.
+            Three things fell out that had nothing to do with the ABI:
+            an aggregate argument must not be wrapped in a cast (it has no
+            conversion to apply, and the cast made it a non-lvalue just as
+            its address was needed); "struct P a = f();" was unsupported
+            while "a = f();" worked, which is not a distinction C makes;
+            and gen_addr() now falls back to gen_expr() for any aggregate,
+            which is what lets id(id(a)) work -- with an explicit lvalue
+            whitelist added at parse time so that "f() = x" is still
+            refused, since being addressable and being assignable are
+            different questions.
+      note: >16 bytes stays refused. It needs stack arguments, which this
+            compiler does not have at all (it stops at six), and returns
+            need the hidden-pointer protocol.
+      proves: 7 planted defects, 7 caught. The oracle is a program gcc
+            compiles the driver for: gcc generates the calls into our
+            functions and receives our returns, and we call and receive
+            gcc's -- because a passing convention can be self-consistently
+            wrong, and only something that was not told what we decided can
+            say otherwise.
 - [ ] 16 integer promotion done properly, rather than the current approximation
       note: the relational half of this turned out to be a real bug and was
             fixed early, as 08b. What is left is the arithmetic half.
@@ -422,18 +480,18 @@ initialisers. That is the whole remaining distance to the fixpoint.
 
 ### Milestone 2 -- external conformance
 
-- [ ] 16 `c-testsuite` runner, publishing the pass rate with the failures named
-- [ ] 17 csmith differential fuzzing against gcc and clang
+- [ ] 18 `c-testsuite` runner, publishing the pass rate with the failures named
+- [ ] 19 csmith differential fuzzing against gcc and clang
       why: finds the cases I would never think to write. Every expectation I have
            written by hand in this project that was wrong, five so far, would have
            been caught here for free.
-- [ ] 18 fix what 16 and 17 surface, one commit per root cause
-- [ ] 19 compile `sqlite3.c`, then run sqlite's own test suite against the result
+- [ ] 20 fix what 18 and 19 surface, one commit per root cause
+- [ ] 21 compile `sqlite3.c`, then run sqlite's own test suite against the result
 
 ### Milestone 3 -- only after the above is green
 
-- [ ] 20 replace the stack machine with a register allocator; keep the fixpoint green
-- [ ] 21 emit ELF objects directly, dropping the `gcc` dependency (see ../ld)
+- [ ] 22 replace the stack machine with a register allocator; keep the fixpoint green
+- [ ] 23 emit ELF objects directly, dropping the `gcc` dependency (see ../ld)
 
 ## Open questions
 

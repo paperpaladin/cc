@@ -608,8 +608,11 @@ check 12  'typedef float F32; double sqrt(double); int main(void){ return sizeof
 check 16  'int main(void){ return sizeof(long double); }'
 unimpl 'int main(void){ double d = 1; return 0; }'
 unimpl 'int main(void){ float f; f = 1; return 0; }'
-unimpl 'struct P { int x; }; int f(struct P p){ return p.x; } int main(void){ return 0; }'
-unimpl 'struct P { int x; }; struct P g(void){ struct P p; p.x=1; return p; } int main(void){ return 0; }'
+# Structs by value, up to 16 bytes. Larger ones are the MEMORY class and
+# need stack arguments, which this compiler does not have.
+unimpl 'struct B { long a,b,c; }; int f(struct B p){ return (int)p.a; } int main(void){ return 0; }'
+unimpl 'struct B { long a,b,c; }; struct B g(void){ struct B p; p.a=1; return p; } int main(void){ return 0; }'
+unimpl 'struct F { double d; }; int f(struct F p){ return 0; } int main(void){ return 0; }'
 unimpl 'int f(int a,int b,int c,int d,int e,int g,int h){ return h; } int main(void){ return f(1,2,3,4,5,6,7); }'
 
 # --- function pointers (PLAN 13)
@@ -635,6 +638,103 @@ check 7   'int g(void){return 7;} int main(){ int (*fp)(void)=g; int (*q)(void)=
 # <stdlib.h> was the last system header, and it stopped on "void (*)(void)".
 check_src 0   '#include <stdlib.h>
 int main(void){ return 0; }'
+
+# --- structs by value (PLAN 15)
+# One argument is no longer one register: an aggregate of 16 bytes or less
+# takes one or two, and the index has to advance by what each parameter
+# actually consumes.
+check 34  'struct P { int x,y; }; int f(struct P p){ return p.x*10+p.y; } int main(){ struct P a; a.x=3; a.y=4; return f(a); }'
+check 56  'struct P { long a,b; }; int f(struct P p){ return (int)(p.a*10+p.b); } int main(){ struct P a; a.a=5; a.b=6; return f(a); }'
+check 123 'struct P { int a,b,c; }; int f(struct P p){ return p.a*100+p.b*10+p.c; } int main(){ struct P a; a.a=1;a.b=2;a.c=3; return f(a); }'
+check 60  'struct P { char a,b,c; }; int f(struct P p){ return p.a+p.b+p.c; } int main(){ struct P a; a.a=10;a.b=20;a.c=30; return f(a); }'
+check 99  'struct P { int x,y; }; int f(int k, struct P p, int m){ return k*1000+p.x*100+p.y*10+m; } int main(){ struct P a; a.x=0;a.y=9; return f(0,a,9)-0; }'
+
+# Returned in rax:rdx, then parked in a hidden local, because every
+# aggregate here is addressed rather than held.
+check 34  'struct P { int x,y; }; struct P mk(int x,int y){ struct P p; p.x=x; p.y=y; return p; } int main(){ struct P a = mk(3,4); return a.x*10+a.y; }'
+check 123 'struct P { int a,b,c; }; struct P mk(void){ struct P p; p.a=1;p.b=2;p.c=3; return p; } int main(){ struct P a = mk(); return a.a*100+a.b*10+a.c; }'
+check 60  'struct P { char a,b,c; }; struct P mk(void){ struct P p; p.a=10;p.b=20;p.c=30; return p; } int main(){ struct P a = mk(); return a.a+a.b+a.c; }'
+check 34  'struct P { int x,y; }; struct P mk(int x,int y){ struct P p; p.x=x; p.y=y; return p; } int main(){ struct P a; a = mk(3,4); return a.x*10+a.y; }'
+
+# A ragged tail must not be read or written past its end. The bytes beyond
+# a 12-byte struct belong to another local, and under test-asan to nobody.
+check 6   'struct P { int a,b,c; }; int f(struct P p){ return p.a+p.b+p.c; } int main(){ struct P a; int guard=7; a.a=1;a.b=2;a.c=3; return f(a)+guard-7; }'
+check 7   'struct P { int a,b,c; }; int f(struct P p){ return 0; } int main(){ struct P a; int guard=7; a.a=1;a.b=2;a.c=3; f(a); return guard; }'
+
+# A struct passed through a chain keeps its value.
+check 34  'struct P { int x,y; }; struct P id(struct P p){ return p; } int main(){ struct P a; a.x=3;a.y=4; struct P b = id(id(a)); return b.x*10+b.y; }'
+
+# gen_addr() gives the address of a struct-returning call, because that is
+# how the result gets passed on. Assignability is a separate question and
+# the answer is still no.
+refuse 'struct P{int x;}; struct P f(void){struct P p; p.x=1; return p;} int main(){ f() = f(); return 0; }'
+refuse 'int main(){ int a; int b; (a+b) = 1; return 0; }'
+refuse 'int f(void){return 1;} int main(){ f() = 2; return 0; }'
+
+# The ABI, judged by the only authority that matters for an ABI: a compiler
+# that was not told what we decided. gcc compiles one side, we compile the
+# other, and they are linked together -- in both directions, because a
+# passing convention can be self-consistently wrong.
+abi_test() {
+  d=$T.abidir
+  rm -rf "$d"; mkdir -p "$d"
+  cat > "$d/decls.h" <<'HDR'
+struct P8  { int x, y; };
+struct P16 { long a, b; };
+struct P12 { int a, b, c; };
+struct Pc  { char a, b, c; };
+HDR
+  # Functions we compile, called and checked by gcc.
+  { cat "$d/decls.h"; cat <<'OURS'
+int  take8 (struct P8  p) { return p.x * 10 + p.y; }
+int  take12(struct P12 p) { return p.a * 100 + p.b * 10 + p.c; }
+int  takec (struct Pc  p) { return p.a + p.b + p.c; }
+int  mixed (int k, struct P8 p, int m) { return k*1000 + p.x*100 + p.y*10 + m; }
+struct P8  mk8 (int x, int y)      { struct P8 p;  p.x=x; p.y=y; return p; }
+struct P12 mk12(int a,int b,int c) { struct P12 p; p.a=a; p.b=b; p.c=c; return p; }
+OURS
+  } > "$d/ours.c"
+  # Functions gcc compiles, called and checked by us.
+  { cat "$d/decls.h"; cat <<'THEIRS'
+int  gtake16(struct P16 p) { return (int)(p.a * 10 + p.b); }
+struct P12 gmk12(int a,int b,int c) { struct P12 p; p.a=a; p.b=b; p.c=c; return p; }
+THEIRS
+  } > "$d/theirs.c"
+  { cat "$d/decls.h"; cat <<'DRV'
+int take8(struct P8); int take12(struct P12); int takec(struct Pc);
+int mixed(int, struct P8, int);
+struct P8 mk8(int,int); struct P12 mk12(int,int,int);
+int gtake16(struct P16); struct P12 gmk12(int,int,int);
+int main(void) {
+  struct P8  a = {3,4};
+  struct P16 b = {5,6};
+  struct P12 c = {1,2,3};
+  struct Pc  d = {10,20,30};
+  if (take8(a)  != 34)  return 1;
+  if (take12(c) != 123) return 2;
+  if (takec(d)  != 60)  return 3;
+  if (mixed(7,a,9) != 7349) return 4;
+  struct P8  e = mk8(3,4);     if (e.x!=3 || e.y!=4) return 5;
+  struct P12 f = mk12(1,2,3);  if (f.a!=1 || f.b!=2 || f.c!=3) return 6;
+  if (gtake16(b) != 56) return 7;
+  struct P12 g = gmk12(4,5,6); if (g.a!=4 || g.b!=5 || g.c!=6) return 8;
+  return 0;
+}
+DRV
+  } > "$d/driver.c"
+
+  if ! "$CCBIN" -S "$d/ours.c" -o "$d/ours.s" 2> "$d/err"; then
+    fail=$((fail + 1)); printf 'FAIL (compile) struct ABI: ours.c\n'; sed 's/^/        /' "$d/err"; rm -rf "$d"; return
+  fi
+  if ! gcc -w -static "$d/ours.s" "$d/theirs.c" "$d/driver.c" -o "$d/bin" 2> "$d/lderr"; then
+    fail=$((fail + 1)); printf 'FAIL (link) struct ABI\n'; sed 's/^/        /' "$d/lderr" | head -4; rm -rf "$d"; return
+  fi
+  "$d/bin"; got=$?
+  if [ "$got" = 0 ]; then pass=$((pass + 1))
+  else fail=$((fail + 1)); printf 'FAIL  struct ABI against gcc, check %s\n' "$got"; fi
+  rm -rf "$d"
+}
+abi_test
 
 #__APPEND_BELOW__
 
