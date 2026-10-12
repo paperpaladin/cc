@@ -1,4 +1,5 @@
 /cc
+/cc-asan
 *.o
 *.s
 *.cc.s
