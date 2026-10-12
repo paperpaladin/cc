@@ -29,9 +29,11 @@ $ make self-host
 ok   stage 1: cc compiles cc.c
 ok   stage 2: cc2 compiles cc.c
 ok   the fixpoint: cc2 and cc3 are byte-identical
-ok   cc2 passes t/run.sh  (302 passed, 0 failed)
+ok   cc2 passes t/run.sh  (325 passed, 0 failed)
 ok   cc2 passes t/cpp.sh  (64 passed, 0 failed)
 ok   cc2 builds an ordinary program through real headers
+
+6 passed, 0 failed
 ```
 
 The fixpoint is the hard invariant this project was built around, and it is
@@ -51,16 +53,23 @@ teeth.
 ## Status
 
 ```
-$ make test        # exit-status assertions
-168 passed, 0 failed
+$ make test        # exit-status assertions; two harnesses, two summaries
+325 passed, 0 failed
+64 passed, 0 failed
 
 $ make diff-test   # the oracle that matters
-166 agree with gcc+clang, 0 disagree, 2 skipped
+282 agree with gcc+clang, 0 disagree, 7 skipped
+10 multi-line case(s) in t/run.sh are not differential-tested
 ```
 
-The 2 skips are `printf`/`strlen` without a declaration -- clang 19 defaults to
-C23, where implicit function declarations are an error, so it won't build them
-as a reference.
+The 7 skips are named in the output, which they were not until recently. Two
+are `printf`/`strlen` without a declaration -- clang 19 defaults to C23, where
+implicit function declarations are an error, so it will not build them as a
+reference. The other five are **every** `va_list` case, including the
+`vsprintf` one this README calls the real oracle: `va_list` is a cc builtin,
+so gcc rejects those sources without `<stdarg.h>`. The variadic ABI is
+therefore not differential-tested at all, and that was invisible while the
+skip was silent.
 
 ### What works
 
@@ -253,18 +262,18 @@ one costing a detour through "is this a codegen bug?" The compiler was right eve
 time. So I stopped guessing -- gcc already knows, and if gcc and clang disagree the
 program relies on undefined behaviour and has no business in the suite.
 
-`t/cpp.sh` is the same idea aimed at the preprocessor: 56 cases, every
+`t/cpp.sh` is the same idea aimed at the preprocessor: 64 cases, every
 expectation produced by **gcc -E -P and clang -E -P**, both of which must
 agree with us. It includes C99 6.10.3.5 examples 3 and 5 verbatim, which are
 the published torture tests for rescanning, `#`, `##` and variadic macros.
 
 ```
 $ make test
-324 passed, 0 failed
+325 passed, 0 failed
 64 passed, 0 failed
 
 $ make test-asan        # the same suite, watched
-324 passed, 0 failed
+325 passed, 0 failed
 64 passed, 0 failed
 ```
 
@@ -279,8 +288,10 @@ exact collision is a bug already recorded in a sibling project, so it was
 cheaper to assume it than discover it.
 
 `detect_leaks=0`, because this compiler frees nothing on purpose and
-LeakSanitizer is right every single time it complains. 237 failures that all
-say the same known thing is the fastest way to stop reading output.
+LeakSanitizer is right every single time it complains. With it on, every case
+fails -- measured, "0 passed, 325 failed" -- since every run ends holding its
+whole AST. All of them saying the same known thing is the fastest way to stop
+reading output.
 
 ### Watching that suite fail
 

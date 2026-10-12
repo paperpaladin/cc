@@ -758,8 +758,25 @@ promotion_matrix() {
         printf 'int main(){ %s; %s; return ((a %s b) > 0) + 2*((a %s b) == 0) + 4*(sizeof(a %s b)); }\n' \
                "$A" "$B" "$OP" "$OP" "$OP" > "$d/m.c"
         _n=$((_n + 1))
-        "$CCBIN" "$d/m.c" -o "$d/m.bin" 2>/dev/null && "$d/m.bin"; _got=$?
-        gcc -w "$d/m.c" -o "$d/m.ref" 2>/dev/null && "$d/m.ref"; _want=$?
+        # `CMD && CMD2; v=$?` stores the compiler's status when the compile
+        # fails, so a program neither compiler accepts gave _got = _want = 1
+        # and scored as agreement. Replacing the generated source with
+        # "THIS IS NOT C AT ALL" left all 320 combinations "agreeing" and the
+        # suite at 325 passed, 0 failed. The compiles are separate steps now,
+        # and a reference that will not build is a failure of the generator
+        # rather than a comparison.
+        if ! gcc -w "$d/m.c" -o "$d/m.ref" 2>/dev/null; then
+          _bad=$((_bad + 1))
+          [ "$_bad" -le 3 ] && printf 'FAIL  %s; %s; a %s b  (gcc will not compile the generated case)\n' "$A" "$B" "$OP"
+          continue
+        fi
+        "$d/m.ref"; _want=$?
+        if ! "$CCBIN" "$d/m.c" -o "$d/m.bin" 2>/dev/null; then
+          _bad=$((_bad + 1))
+          [ "$_bad" -le 3 ] && printf 'FAIL  %s; %s; a %s b  (cc will not compile it; gcc did)\n' "$A" "$B" "$OP"
+          continue
+        fi
+        "$d/m.bin"; _got=$?
         if [ "$_got" != "$_want" ]; then
           _bad=$((_bad + 1))
           [ "$_bad" -le 3 ] && printf 'FAIL  %s; %s; a %s b  (got %s, gcc %s)\n' "$A" "$B" "$OP" "$_got" "$_want"
@@ -767,7 +784,13 @@ promotion_matrix() {
       done
     done
   done
-  if [ "$_bad" = 0 ]; then
+  # The count is pinned too: nothing asserted it, so emptying the outer loop
+  # list gave "ok  0 operand/operator combinations agree with gcc" and left
+  # the total at 325, because each matrix contributes exactly one pass.
+  if [ "$_n" -ne 320 ]; then
+    fail=$((fail + 1))
+    printf 'FAIL  promotion matrix generated %d combinations, expected 320\n' "$_n"
+  elif [ "$_bad" = 0 ]; then
     pass=$((pass + 1))
     printf 'ok    %d operand/operator combinations agree with gcc on sign, zero and sizeof\n' "$_n"
   else
@@ -794,8 +817,20 @@ shift_matrix() {
         printf 'int main(){ %s; return ((a %s %s) > 0) + 2*((a %s %s) == 0) + 4*(sizeof(a %s %s)); }\n' \
                "$A" "$OP" "$N" "$OP" "$N" "$OP" "$N" > "$d/s.c"
         _n=$((_n + 1))
-        "$CCBIN" "$d/s.c" -o "$d/s.bin" 2>/dev/null && "$d/s.bin"; _got=$?
-        gcc -w "$d/s.c" -o "$d/s.ref" 2>/dev/null && "$d/s.ref"; _want=$?
+        # Same `CMD && CMD2; v=$?` defect as the promotion matrix above: both
+        # compilers failing read as agreement.
+        if ! gcc -w "$d/s.c" -o "$d/s.ref" 2>/dev/null; then
+          _bad=$((_bad + 1))
+          [ "$_bad" -le 3 ] && printf 'FAIL  %s; a %s %s  (gcc will not compile the generated case)\n' "$A" "$OP" "$N"
+          continue
+        fi
+        "$d/s.ref"; _want=$?
+        if ! "$CCBIN" "$d/s.c" -o "$d/s.bin" 2>/dev/null; then
+          _bad=$((_bad + 1))
+          [ "$_bad" -le 3 ] && printf 'FAIL  %s; a %s %s  (cc will not compile it; gcc did)\n' "$A" "$OP" "$N"
+          continue
+        fi
+        "$d/s.bin"; _got=$?
         if [ "$_got" != "$_want" ]; then
           _bad=$((_bad + 1))
           [ "$_bad" -le 3 ] && printf 'FAIL  %s; a %s %s  (got %s, gcc %s)\n' "$A" "$OP" "$N" "$_got" "$_want"
@@ -803,7 +838,10 @@ shift_matrix() {
       done
     done
   done
-  if [ "$_bad" = 0 ]; then
+  if [ "$_n" -ne 48 ]; then
+    fail=$((fail + 1))
+    printf 'FAIL  shift matrix generated %d combinations, expected 48\n' "$_n"
+  elif [ "$_bad" = 0 ]; then
     pass=$((pass + 1))
     printf 'ok    %d shift combinations agree with gcc on sign, zero and sizeof\n' "$_n"
   else
