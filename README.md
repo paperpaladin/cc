@@ -160,7 +160,7 @@ accept. Nothing here needs it, and the tokenizer is simpler without it.
 
 No floating-point arithmetic. `float`, `double` and `long double` are
 declarable: they parse, size correctly at 4, 8 and 16, and appear in
-declarations, which is what real headers need, but producing a value of
+declarations, enough for real headers, but producing a value of
 one is an error, not a silent miscompilation. No `va_arg` of a
 struct.
 

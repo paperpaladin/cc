@@ -23,7 +23,7 @@ fixpoint proves the compiler is STABLE, not correct: at the first green
 `cmp cc2 cc3`, cc2 still failed 15 cases of t/run.sh, because a compiler
 that miscompiles itself self-consistently reaches a fixpoint without
 complaint. The invariant is therefore the fixpoint AND the stage-2 compiler
-passing the whole suite, which is what `make self-host` asserts.
+passing the whole suite, the thing `make self-host` asserts.
 
 ## Oracle
 
@@ -34,7 +34,7 @@ Ranked by how little I control them:
 3. `c-testsuite` pass rate, reported honestly including failures.
 4. Compiling a real third-party program. `sqlite3.c` is the target.
 
-Oracle 1 already caught two bugs, in my own test expectations, which is the
+Oracle 1 already caught two bugs, in my own test expectations, and that is the
 point.
 
 ## Non-goals
@@ -78,8 +78,8 @@ possible, because the fixpoint is worth more than any individual feature.
            own source and at /usr/include says which items are real.
       done: three gaps the plan did not have.
             Line splicing (phase 2) was simply missing. A backslash before a
-            newline joins the lines before anything is a token, which is why
-            it can cut an identifier in half; glibc uses it constantly.
+            newline joins the lines before anything is a token, so it can cut
+            an identifier in half; glibc uses it constantly.
             declspec parsed specifiers positionally, so "unsigned long" worked
             and "long unsigned int" did not, and stddef.h writes the second.
             Rewritten as a counter over the specifier multiset, which handles
@@ -214,8 +214,8 @@ initialisers. That is the whole remaining distance to the fixpoint.
             instruction for the linker; eval_addr() is eval() extended to
             return label+addend for the forms a linker can resolve.
             Covers scalars, arrays, nested arrays, structs, strings into char
-            arrays, &global, array decay, and pointer+offset, which is the
-            whole of what cc.c's own KEYWORDS and PUNCT tables need.
+            arrays, &global, array decay, and pointer+offset, the whole of what
+            cc.c's own KEYWORDS and PUNCT tables need.
             Sections split properly now: .bss for uninitialised, .data for
             initialised, .rodata for string literals.
             Unsized arrays had to learn their length before the incomplete
@@ -224,7 +224,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
       found: "extern int e = 1;" was being refused. gcc accepts it and gcc is
             right, C11 6.9.2 says a file-scope declaration with an
             initialiser IS a definition. This is the first thing refuse()
-            caught in cc, not in a test, which is the entire argument
+            caught in cc, not in a test, the entire argument
             for making a refusal require an outside authority to agree.
       proves: 6 planted defects. 4 caught by `make test`, 1 more only by
             `make test-asan` (see below), 1 left alive on purpose.
@@ -254,7 +254,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
             entry to a known 48-byte block, because a variadic function has
             to hand out arguments that arrived in registers and registers
             are not addressable. Named parameters are therefore stored
-            twice, which is what the ABI asks for: the block must be a
+            twice, as the ABI asks: the block must be a
             contiguous image of the registers for va_arg to index.
             va_list is built in the parser instead of reading from a header,
             since its layout is fixed by the ABI and the real <stdarg.h> is
@@ -323,7 +323,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
             over a handful of tokens; the alternative is threading a
             half-built type through the recursion.
             A call became an operator in postfix() instead of something
-            only a bare name can do, which is what makes "m->builtin(tok)"
+            only a bare name can do, and that is what makes "m->builtin(tok)"
             writable: the shape cc.c uses. A function joined arrays and
             aggregates in is_address_valued(), because its value is its
             address; without that, loading a function designator emits
@@ -368,7 +368,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
             aggregate argument must not be wrapped in a cast (no conversion
             applies, and the cast made it a non-lvalue exactly where its
             address was needed); "struct P a = f();" was unsupported while
-            "a = f();" worked, which is not a distinction C makes; and
+            "a = f();" worked, no distinction C makes; and
             gen_addr() falls back to gen_expr() for any aggregate, which is
             what lets id(id(a)) work, with an explicit lvalue whitelist
             added at parse time so "f() = x" is still refused, because
@@ -398,7 +398,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
             an aggregate argument must not be wrapped in a cast (it has no
             conversion to apply, and the cast made it a non-lvalue just as
             its address was needed); "struct P a = f();" was unsupported
-            while "a = f();" worked, which is not a distinction C makes;
+            while "a = f();" worked, no distinction C makes;
             and gen_addr() now falls back to gen_expr() for any aggregate,
             which is what lets id(id(a)) work, with an explicit lvalue
             whitelist added at parse time so that "f() = x" is still
@@ -479,7 +479,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
       state: <stddef.h> <stdarg.h> <string.h> <ctype.h> <stdint.h>
             <limits.h> <stdbool.h> all compile from /usr/include and run.
             <stdio.h> stops at a function typedef and <stdlib.h> at
-            "typedef float _Float32", which is the first time the no-float
+            "typedef float _Float32", the first time the no-float
             decision has actually cost anything.
 
 - [x] 12d real headers, and floating point as a declarable type
@@ -487,7 +487,7 @@ initialisers. That is the whole remaining distance to the fixpoint.
            and refusing the TYPE blocks headers that never do arithmetic.
       done: float, double and long double parse, size correctly (4, 8, 16)
             and take part in declarations. Producing a VALUE of one is a
-            named error in load() and store(), which is the only place a
+            named error in load() and store(), the only place a
             floating-point register would be needed. Declarable, not
             operable, and the suite asserts both halves.
             Function typedefs ("typedef int handler(void *)") parse; only
