@@ -630,6 +630,16 @@ check 8   'int main(){ int (*fp)(int); return sizeof(fp); }'
 # A dispatch table, which is the shape this exists for.
 check 0   'int a(int x){return x+1;} int b(int x){return x*2;} int main(){ int (*t[2])(int); t[0]=a; t[1]=b; int s=0; int i; for(i=0;i<2;i=i+1) s=s+t[i](10); return s-31; }'
 
+# A function declared inside a block declares a function, not an object.
+# Falling through to the local-variable path gave it a stack slot and the
+# call went through those eight bytes, which segfaulted. Found by
+# c-testsuite 00078; kept here because that corpus is fetched and skips
+# when offline, and a fix with no local test is a fix waiting to be undone.
+check 2   'int f(char *p){return *p+1;} int main(){ char s=1; int f(char *); return f(&s); }'
+check 0   'int f(void){return 7;} int main(){ int f(void); return f()-7; }'
+check 0   'int f(void){return 3;} int main(){ { int f(void); if(f()!=3) return 1; } return f()-3; }'
+check 5   'int g(int);int g(int x){return x;} int main(){ int g(int); return g(5); }'
+
 # The call has to go THROUGH the pointer. Emitting a direct call to the
 # symbol named by the variable links cleanly and jumps to the pointer
 # itself, so this is a runtime check, not a compile-time one.
