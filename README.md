@@ -483,6 +483,61 @@ as an array does. The array is still correct and still what C specifies; it
 simply stops mattering until aggregates can be passed by value. Its first version claimed the struct form would silently pass a copy,
 which was a confident explanation of something that does not happen.
 
+## 220 programs nobody here wrote
+
+```
+$ make conformance
+c-testsuite: 182 of 220 pass (82%)
+  no regressions against t/cts-baseline.txt
+  by kind:
+       34 refused
+        3 MISCOMPILED-stdout
+        1 MISCOMPILED-signal
+  accepted and then wrong, which is the bad kind:
+    00078 MISCOMPILED-signal11
+    00206 MISCOMPILED-stdout
+    00212 MISCOMPILED-stdout
+    00218 MISCOMPILED-stdout
+```
+
+Every other oracle here compares cc against gcc and clang on programs
+this repository wrote. That answers "do the three of us agree about my
+test cases". This corpus answers a different question, which is how much
+of the language is actually here, and the only way to ask it is with
+cases nobody here chose.
+
+The two kinds of failure are never merged into one number. A refusal is
+a gap: cc declined, which is the honest answer to a feature it does not
+have. A miscompilation is a bug: cc accepted the program and produced a
+binary that crashed or printed the wrong thing. Thirty-four of the
+thirty-eight failures are the first kind. Four are the second, and they
+were invisible until this ran.
+
+The smallest of them is six lines:
+
+```c
+int f1(char *p) { return *p + 1; }
+int main(void) {
+	char s = 1;
+	int f1(char *);          /* a declaration at block scope */
+	return f1(&s) == 2 ? 0 : 1;
+}
+```
+
+gcc compiles that to something that exits 0. cc compiles it to something
+that segfaults. Delete the inner declaration and cc is correct again.
+
+The gate is no regression rather than a pass rate, since cc implements a
+subset on purpose and most of these failures are expected. The baseline
+is checked in both directions: a case that starts passing has to be
+removed from it, or the file rots into a list nobody rechecks. Both
+directions were tested by breaking them.
+
+The corpus is fetched rather than vendored, pinned to one commit and
+checked by sha256. Its per-test metadata records where each case came
+from and gives no licence, so redistributing them here would be a claim
+about rights nobody here holds. Offline, the target skips and says so.
+
 ## Real headers
 
 `<stdio.h>`, `<string.h>`, `<ctype.h>`, `<stdint.h>`, `<limits.h>`,

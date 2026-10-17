@@ -512,7 +512,43 @@ the whole suite.
 
 ### Milestone 2: external conformance
 
-- [ ] 18 `c-testsuite` runner, publishing the pass rate with the failures named
+- [x] 18 `c-testsuite` runner, publishing the pass rate with the failures named
+      files: t/cts.sh t/cts-baseline.txt Makefile
+      proves: 182 of 220 pass, 82%. Every other oracle here compares cc
+              against gcc and clang on programs this repository wrote;
+              this is 220 written by other people, so it answers a
+              different question: how much of the language is actually
+              here.
+      note: the corpus is fetched, not vendored. Its per-test metadata
+            records an origin for each case and no licence, so shipping
+            them inside this repository would be a claim about rights
+            nobody here holds. Pinned to commit 5c72756 and checked by
+            sha256, so a result cannot shift under it. Offline it skips
+            loudly.
+      note: the gate is no regression, not a pass rate, and the baseline
+            is checked in BOTH directions. A case that starts passing
+            must be removed from the baseline, or the file rots into a
+            list nobody rechecks and the gate weakens every time cc
+            improves. Both directions were mutation-tested: removing a
+            known failure reports REGRESSED and exits 1, adding a
+            passing case reports it as fixed and exits 1.
+      found: four miscompilations, which is the bad kind. A refusal is a
+             gap and the output says "refused"; a program cc ACCEPTED
+             and then got wrong says MISCOMPILED, because merging those
+             two into one number would have hidden these.
+             00078 segfaults: a block-scope function declaration. Six
+             lines reproduce it, and gcc compiles the same program to
+             something that exits 0.
+             00212 prints "KO no __*LP*__ defined": cc does not predefine
+             __LP64__.
+             00218 prints "unsigned enum bit-fields broken".
+             00206 differs from the expected output later in the stream.
+- [ ] 24 fix the four miscompilations c-testsuite found, one commit per
+      root cause
+      why: cc's whole argument is that a missing feature must be a
+           refusal and never a wrong answer. Four cases say otherwise,
+           and they were invisible until a corpus nobody here wrote was
+           pointed at it.
 - [ ] 19 csmith differential fuzzing against gcc and clang
       note: csmith has to be fetched and built, and nothing in this project
             downloads and runs third-party code without being asked. 19b
