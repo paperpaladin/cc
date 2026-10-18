@@ -553,8 +553,21 @@ the whole suite.
             cases added to t/run.sh, because the corpus is fetched and
             skips offline, and a fix with no local test is a fix waiting
             to be undone.
-      left: 00212 (no __LP64__ predefined), 00218 (unsigned enum
-            bit-fields), 00206 (output diverges later in the stream).
+      done: 00212, the missing __LP64__, fixed, and the fix was wider
+            than the one macro. gcc predefines 400 and we had 44; the
+            diff, filtered to what a real program tests, was 23
+            platform macros absent. All 24 are there now (23 plus
+            _LP64), with gcc computing every expected value: the test
+            compiles the same program with both and compares what the
+            binaries return, so a wrong value fails and so does an
+            absent one. Four mutations, all caught.
+            __SIZEOF_INT128__, __SIZEOF_FLOAT80__ and
+            __SIZEOF_FLOAT128__ are deliberately still absent. They
+            would advertise types this compiler refuses, which turns a
+            clean "unknown type name" into a header taking a branch
+            that cannot work.
+      left: 00218 (unsigned enum bit-fields), 00206 (output diverges
+            later in the stream).
       why: cc's whole argument is that a missing feature must be a
            refusal and never a wrong answer. Four cases say otherwise,
            and they were invisible until a corpus nobody here wrote was
