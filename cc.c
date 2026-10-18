@@ -1397,16 +1397,27 @@ static Type *enum_decl(void) {
   Type *ty = new_enum_type();
   long val = 0;
   bool first = true;
+  // C11 6.7.2.2p4 leaves the compatible type implementation-defined.
+  // gcc picks unsigned int when no enumerator is negative and int
+  // otherwise, checked rather than assumed: (enum e)-1 > 0 is 1 for an
+  // all-positive enum under gcc and 0 for one with a negative member.
+  // It matters for a bit-field of enum type, where the signedness
+  // decides whether the top bit of the stored value comes back as a
+  // sign. c-testsuite 00218 is that case: 150 stored in an 8-bit field
+  // and read back as -106.
+  bool any_negative = false;
   while (!consume("}")) {
     if (!first) expect(",");
     first = false;
     if (consume("}")) break;                  // trailing comma
     char *name = get_ident();
     if (consume("=")) val = const_expr();
+    if (val < 0) any_negative = true;
     VarScope *vs = push_scope(name);
     vs->enum_ty = ty;
     vs->enum_val = (int)val++;
   }
+  ty->is_unsigned = !any_negative;
 
   if (tag) push_tag(strndup(tag->loc, tag->len), ty);
   return ty;

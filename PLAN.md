@@ -566,8 +566,17 @@ the whole suite.
             would advertise types this compiler refuses, which turns a
             clean "unknown type name" into a header taking a branch
             that cannot work.
-      left: 00218 (unsigned enum bit-fields), 00206 (output diverges
-            later in the stream).
+      done: 00218, unsigned enum bit-fields, fixed. new_enum_type
+            never set is_unsigned, so every enum was signed and an
+            8-bit bit-field of enum type read 150 back as -106. C11
+            6.7.2.2p4 leaves the compatible type implementation-
+            defined; gcc picks unsigned int when no enumerator is
+            negative and int otherwise, taken from gcc rather than
+            from the standard's silence. Six local cases, four
+            mutations, all caught, and the self-host fixpoint still
+            holds, which it had to: this changes the type of every
+            enum in cc's own source.
+      left: 00206 (output diverges later in the stream).
       why: cc's whole argument is that a missing feature must be a
            refusal and never a wrong answer. Four cases say otherwise,
            and they were invisible until a corpus nobody here wrote was
