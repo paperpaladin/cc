@@ -2782,6 +2782,22 @@ struct CondIncl {
 
 static Macro *macros;
 static CondIncl *cond_incl;
+
+// #pragma push_macro("X") / pop_macro("X"), a gcc extension. One stack
+// for all names, which is what gcc does: a pop takes the most recent
+// push of that name wherever it sits in the stack.
+//
+// saved == NULL is a real entry and means the macro was not defined
+// when it was pushed, so popping it must undefine rather than do
+// nothing. undef_macro only unlinks, it does not free, so a pointer
+// saved here stays valid even after a later #define replaces it.
+typedef struct MacroSave MacroSave;
+struct MacroSave {
+  MacroSave *next;
+  char *name;
+  Macro *saved;
+};
+static MacroSave *macro_stack;
 static char *include_paths[64];
 static int n_include_paths;
 
@@ -2938,6 +2954,12 @@ static Macro *find_macro(Token *t) {
   return NULL;
 }
 
+static Macro *find_macro_named(char *name) {
+  for (Macro *m = macros; m; m = m->next)
+    if (!strcmp(m->name, name)) return m;
+  return NULL;
+}
+
 static void undef_macro(char *name) {
   Macro **p = &macros;
   while (*p) {
@@ -2956,6 +2978,24 @@ static Macro *add_macro(char *name, bool is_objlike, Token *body) {
   m->next = macros;
   macros = m;
   return m;
+}
+
+static void push_macro_def(char *name) {
+  MacroSave *e = calloc(1, sizeof(MacroSave));
+  e->name = name;
+  e->saved = find_macro_named(name);
+  e->next = macro_stack;
+  macro_stack = e;
+}
+
+static void pop_macro_def(char *name) {
+  MacroSave **p = &macro_stack;
+  while (*p && strcmp((*p)->name, name)) p = &(*p)->next;
+  if (!*p) return;                      // gcc ignores an unmatched pop
+  MacroSave *e = *p;
+  *p = e->next;
+  undef_macro(name);
+  if (e->saved) { e->saved->next = macros; macros = e->saved; }
 }
 
 static Macro *add_builtin(char *name, Token *(*fn)(Token *)) {
@@ -3752,8 +3792,28 @@ static Token *preprocess2(Token *tok) {
       continue;
     }
 
-    // #pragma and #line change nothing this compiler can observe. Skipping
-    // them beats rejecting them, and both appear in real headers.
+    // push_macro and pop_macro are the two pragmas that change what the
+    // preprocessor produces, so ignoring them is a miscompilation and not
+    // a missing feature: the program keeps building, with the wrong macro
+    // body. c-testsuite 00206 is that, and it prints the wrong string
+    // twice rather than failing.
+    if (tok_is(tok, "pragma") && tok->next &&
+        (tok_is(tok->next, "push_macro") || tok_is(tok->next, "pop_macro"))) {
+      bool pushing = tok_is(tok->next, "push_macro");
+      Token *t = tok->next->next;
+      if (!tok_is(t, "(") || t->next->kind != TK_STR ||
+          !tok_is(t->next->next, ")"))
+        error_at(tok->loc, "#pragma %s expects (\"name\")",
+                 pushing ? "push_macro" : "pop_macro");
+      if (pushing) push_macro_def(t->next->str);
+      else pop_macro_def(t->next->str);
+      tok = skip_line(tok);
+      continue;
+    }
+
+    // Every other #pragma, and #line, change nothing this compiler can
+    // observe. Skipping them beats rejecting them, and both appear in
+    // real headers.
     if (tok_is(tok, "pragma") || tok_is(tok, "line")) { tok = skip_line(tok); continue; }
 
     error_at(tok->loc, "unknown directive #%s", tok_text(tok));

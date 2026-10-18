@@ -543,7 +543,7 @@ the whole suite.
              __LP64__.
              00218 prints "unsigned enum bit-fields broken".
              00206 differs from the expected output later in the stream.
-- [ ] 24 fix the remaining three miscompilations c-testsuite found, one
+- [x] 24 fix the remaining three miscompilations c-testsuite found, one
       commit per root cause
       done: 00078, the block-scope function declaration, fixed. A
             function declared inside a block declares a function with
@@ -576,7 +576,15 @@ the whole suite.
             mutations, all caught, and the self-host fixpoint still
             holds, which it had to: this changes the type of every
             enum in cc's own source.
-      left: 00206 (output diverges later in the stream).
+      done: 00206, #pragma push_macro and pop_macro. cc skipped every
+            pragma, which is correct for the ones that change nothing
+            observable and wrong for these two: the program built with
+            the wrong macro body, printed the wrong string twice and
+            exited 0. A saved-macro stack, 30 lines. Six cases in
+            t/cpp.sh, where both gcc and clang are the oracle, and
+            five mutations, all caught.
+      result: no miscompilations left. 186 of 220, and all 34 remaining
+            failures are refusals. That was the point of the item.
       why: cc's whole argument is that a missing feature must be a
            refusal and never a wrong answer. Four cases say otherwise,
            and they were invisible until a corpus nobody here wrote was
