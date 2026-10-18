@@ -590,11 +590,40 @@ the whole suite.
            and they were invisible until a corpus nobody here wrote was
            pointed at it.
 - [ ] 19 csmith differential fuzzing against gcc and clang
-      note: csmith has to be fetched and built, and nothing in this project
-            downloads and runs third-party code without being asked. 19b
-            takes the same approach with a generator written here: the
-            generator being ours costs nothing, because the ORACLE is still
-            gcc and clang, and that is the part that has to be independent.
+      BLOCKED: csmith is not installed and nothing in this project fetches
+            and runs third-party code without being asked. That is a
+            decision for whoever owns the machine, not something to do
+            quietly, so this item waits for `dnf install csmith` or an
+            explicit instruction rather than sitting at the top of the
+            queue pretending to be the next thing to do. It was offered as
+            the next action for weeks while being undoable.
+      note: 19b takes the same approach with a generator written here. The
+            generator being ours costs nothing, because the ORACLE is
+            still gcc and clang, and that is the part that has to be
+            independent.
+- [x] 19c widen the generator, and make its coverage a measured thing
+      why: 400 seeds agreed, which is either evidence the compiler is
+           right or evidence the generator is narrow, and nothing said
+           which. It was the second: the generator emitted no enums, no
+           switch, no compound assignment and no increment operators,
+           so agreement over those constructs was agreement about
+           nothing.
+      done: all four added, plus enum-typed BIT-FIELDS specifically,
+           which is the only context where an enum's signedness is
+           observable at all and was a real miscompilation here a day
+           ago. With that defect planted again, the widened generator
+           disagrees on 17 of 60 seeds; the old one could not have
+           found it, because it never wrote the word enum.
+           Frequencies were tuned by measurement, not by guess. At the
+           first attempt the new constructs appeared in about one
+           program in thirty, and the fuzzer reported 300 agree either
+           way, which is the same vacuity in a new place.
+           t/fuzz.sh now prints a census of what was actually
+           generated and fails if any construct falls to a floor. With
+           the enum branch disabled it refuses to report a result at
+           all rather than reporting 60 agree, which is the behaviour
+           worth having: agreement over a range that never generated a
+           construct is not evidence about that construct.
 - [x] 19b a random program generator, differentially tested against gcc and
       clang, needing nothing fetched
       done: t/gen.py and t/fuzz.sh, plus `make fuzz` and a 20-seed smoke
