@@ -81,7 +81,14 @@ for src in "$SRC"/*.c; do
 		failed="$failed $name:refused"
 		continue
 	fi
-	"$work/$name" >"$work/$name.out" 2>/dev/null
+	# Run it from the scratch directory, not from the repository root. A
+	# corpus case is somebody else's program and may write files: 00187
+	# opens "fred.txt" for writing, and with the root as the working
+	# directory that is exactly where it landed. cq c stages the whole
+	# tree, so the file went into the commit that added this script, and
+	# nothing referenced it. Here it lands in $work and the EXIT trap
+	# takes it.
+	( cd "$work" && ./"$name" >"$name.out" 2>/dev/null )
 	st=$?
 	if [ "$st" -gt 128 ]; then
 		failed="$failed $name:MISCOMPILED-signal$((st - 128))"

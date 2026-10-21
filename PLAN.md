@@ -757,12 +757,20 @@ the whole suite.
             README: 7 floating point, 2 anonymous members, 2 statement
             expressions, 2 forward enum tags, and twelve more one at a
             time.
-      housekeeping found on the way: fred.txt, two lines reading hello,
-            was swept into commit e32d7d4 by cq c staging the whole tree,
-            and nothing referenced it. And t/fuzz-fail-*.c was in make
-            clean but not in .gitignore, so any commit made after a real
-            fuzz failure would have carried the reproducers; twenty were
-            in the tree during this session from mutation runs.
+      housekeeping found on the way, and the first of them twice over.
+            fred.txt, two lines reading hello, was swept into commit
+            e32d7d4 by cq c staging the whole tree. Deleting it was the
+            symptom: it came back on the next `make conformance`, because
+            t/cts.sh ran each corpus binary from the repository root and
+            case 00187 opens "fred.txt" for writing. A corpus case is
+            somebody else's program and may write anything it likes.
+            cts.sh runs them in its scratch directory now, where the EXIT
+            trap takes whatever they leave. 195 of 220 either way, so no
+            case depended on the old working directory.
+            And t/fuzz-fail-*.c was in make clean but not in .gitignore,
+            so any commit made after a real fuzz failure would have
+            carried the reproducers; twenty were in the tree during this
+            session from mutation runs.
 - [x] 20b the file buffer was larger than its data, and `make overread`
       why: not from 18 or 19. It is the collection's buffer shape, and a
            compiler reading source into a grown buffer and indexing it by
