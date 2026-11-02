@@ -398,15 +398,19 @@ report arrived from `<built-in>` and the target went green. It now probes
 only files whose name is not in angle brackets. A gate watched to fail is
 not the same as a gate watched to fail for the right reason.
 
-Two things that remain, so the next sweep starts from a list. The probe
-file carries a line continuation on purpose, or only `read_file`'s two
-spare bytes would be in play and the invisible half of the shape would go
-ungated. And `static_local_name` still asks for `strlen(name) + 16` bytes
-to hold a label about twelve bytes long, the tokenizer's string literal
-buffer is a bounds-checked `char[4096]`, and five more fixed stack arrays
-are written by `snprintf`. All of them hold short generated text rather
-than input and none has a gate over it, which is a decision rather than
-an oversight.
+One detail of the target, because it is easy to undo by accident: the
+probe file carries a line continuation deliberately. Without one only
+`read_file`'s two spare bytes are in play, and the invisible half of the
+shape, the byte `splice_lines` deletes, goes ungated.
+
+What is left, so the next sweep starts from a list rather than from
+memory. `static_local_name` still asks for `strlen(name) + 16` bytes to
+hold a label about twelve bytes long. The tokenizer's string literal
+buffer is a `char[4096]` with an explicit length check and an error. Seven
+more fixed stack arrays, `char[32]` and `char[24]`, hold generated labels
+and names written by `snprintf`. None of them holds input and none has a
+gate over it. That is a decision rather than an oversight, and it is the
+list to start from if one of those ever holds something a program chose.
 
 ### Watching that suite fail
 
